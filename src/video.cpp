@@ -1504,7 +1504,18 @@ namespace video {
         continue;
       }
 
-      disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+      // Check for multi-monitor composite capture
+      auto mm_state = config::get_multi_monitor_state();
+      if (mm_state.monitor_count > 1 && !mm_state.display_device_ids.empty()) {
+        disp = platf::display_composite(
+          encoder.platform_formats->dev_type,
+          mm_state.display_device_ids,
+          mm_state.per_monitor_width,
+          mm_state.per_monitor_height,
+          capture_ctxs.front().config);
+      } else {
+        disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+      }
       if (disp) {
         break;
       }

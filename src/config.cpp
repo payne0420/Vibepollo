@@ -2330,6 +2330,32 @@ namespace config {
     return video.output_name;
   }
 
+  // Multi-monitor runtime state
+  static std::mutex g_multi_monitor_mutex;
+  static multi_monitor_state_t g_multi_monitor_state;
+
+  void set_multi_monitor_state(const multi_monitor_state_t &state) {
+    std::lock_guard<std::mutex> lock(g_multi_monitor_mutex);
+    g_multi_monitor_state = state;
+    BOOST_LOG(info) << "Multi-monitor state set: " << state.monitor_count
+                    << " monitors at " << state.per_monitor_width << "x" << state.per_monitor_height;
+  }
+
+  void clear_multi_monitor_state() {
+    std::lock_guard<std::mutex> lock(g_multi_monitor_mutex);
+    g_multi_monitor_state = multi_monitor_state_t {};
+  }
+
+  multi_monitor_state_t get_multi_monitor_state() {
+    std::lock_guard<std::mutex> lock(g_multi_monitor_mutex);
+    return g_multi_monitor_state;
+  }
+
+  bool is_multi_monitor_active() {
+    std::lock_guard<std::mutex> lock(g_multi_monitor_mutex);
+    return g_multi_monitor_state.monitor_count > 1;
+  }
+
   void apply_config_now() {
     // Ensure only one apply runs at a time and block session start/resume while applying.
     std::unique_lock<std::shared_mutex> write_gate(g_apply_gate);

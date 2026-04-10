@@ -34,6 +34,15 @@ namespace stream {
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;
 
+  /**
+   * @brief Tracks individual virtual display state for multi-monitor sessions.
+   */
+  struct virtual_display_info_t {
+    std::string device_id;
+    std::array<std::uint8_t, 16> guid_bytes {};
+    std::optional<std::chrono::steady_clock::time_point> ready_since;
+  };
+
   struct launch_session_t {
     uint32_t id;
 
@@ -57,6 +66,12 @@ namespace rtsp_stream {
     int height;
     int fps;
     int gcmap;
+
+    // Multi-monitor support
+    int multi_monitor_count = 1;
+    int per_monitor_width = 0;
+    int per_monitor_height = 0;
+    std::vector<virtual_display_info_t> multi_virtual_displays;
 
     struct app_metadata_t {
       std::string id;
