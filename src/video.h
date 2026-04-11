@@ -360,6 +360,19 @@ namespace video {
     void *channel_data
   );
 
+  /**
+   * @brief Multi-stream region capture: captures a combined frame and distributes
+   * per-monitor crops to N independent encode pipelines.
+   */
+  void capture_multi_region(
+    safe::mail_t mail,
+    config_t config,
+    void *channel_data,
+    int num_streams,
+    int per_monitor_width,
+    int per_monitor_height
+  );
+
   bool validate_encoder(encoder_t &encoder, bool expect_failure);
 
   /**

@@ -2212,30 +2212,18 @@ namespace stream {
       BOOST_LOG(debug) << "Start capturing Video (single stream)"sv;
       video::capture(session->mail, session->config.monitor, session);
     } else {
-      // Multi-stream: spawn N capture threads, one per region
-      BOOST_LOG(info) << "Start capturing Video (" << num_streams << " streams)"sv;
+      // Multi-stream region splitting: one capture thread produces the combined frame,
+      // then crops it into N per-monitor regions and encodes each separately.
+      auto mm_state = config::get_multi_monitor_state();
+      BOOST_LOG(info) << "Start capturing Video (" << num_streams << " streams, region split)"sv;
 
-      std::vector<std::thread> capture_threads;
-
-      for (int i = 1; i < num_streams; i++) {
-        video::config_t per_stream_config = session->config.monitor;
-        per_stream_config.stream_index = i;
-
-        capture_threads.emplace_back([mail = session->mail, cfg = std::move(per_stream_config), session]() {
-          BOOST_LOG(info) << "Capture thread for stream " << cfg.stream_index << " started";
-          video::capture(mail, cfg, session);
-        });
-      }
-
-      // Stream 0 runs on this thread
-      auto stream0_config = session->config.monitor;
-      stream0_config.stream_index = 0;
-      video::capture(session->mail, stream0_config, session);
-
-      // Wait for additional capture threads to finish
-      for (auto &t : capture_threads) {
-        if (t.joinable()) t.join();
-      }
+      video::capture_multi_region(
+        session->mail,
+        session->config.monitor,
+        session,
+        num_streams,
+        mm_state.per_monitor_width,
+        mm_state.per_monitor_height);
     }
   }
 

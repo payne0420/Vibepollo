@@ -1647,7 +1647,40 @@ namespace video {
           }
 
           if (frame_captured) {
-            capture_ctx->images->raise(img);
+            // Multi-stream region crop: if the encoder expects a smaller frame than
+            // what was captured (combined display), crop to the region for this stream.
+            if (img && img->data &&
+                capture_ctx->config.width > 0 &&
+                capture_ctx->config.width < (int) img->width) {
+              int region_idx = capture_ctx->config.stream_index;
+              int crop_w = capture_ctx->config.width;
+              int crop_h = capture_ctx->config.height;
+              int src_x = region_idx * crop_w;
+              int bpp = 4;  // BGRA
+
+              auto cropped = disp->alloc_img();
+              if (cropped) {
+                cropped->width = crop_w;
+                cropped->height = crop_h;
+                cropped->row_pitch = crop_w * bpp;
+                cropped->frame_timestamp = img->frame_timestamp;
+
+                // Allocate buffer if not already allocated by alloc_img
+                if (!cropped->data) {
+                  cropped->data = new std::uint8_t[crop_w * crop_h * bpp];
+                }
+
+                for (int row = 0; row < crop_h && row < (int) img->height; row++) {
+                  auto *dst = cropped->data + row * cropped->row_pitch;
+                  auto *src = img->data + row * img->row_pitch + src_x * bpp;
+                  std::memcpy(dst, src, crop_w * bpp);
+                }
+
+                capture_ctx->images->raise(std::move(cropped));
+              }
+            } else {
+              capture_ctx->images->raise(img);
+            }
           }
 
           ++capture_ctx;
@@ -2349,7 +2382,7 @@ namespace video {
     BOOST_LOG(info) << "Encoding Frame threshold: "sv << encode_frame_threshold;
 
     auto shutdown_event = mail->event<bool>(mail::shutdown);
-    auto packets = mail::man->queue<packet_t>(mail::video_packets);
+    auto packets = mail::man->queue<packet_t>(mail::video_packets_name(config.stream_index));
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
 
@@ -2946,7 +2979,7 @@ namespace video {
       ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
         &join_event,
         mail->event<bool>(mail::shutdown),
-        mail::man->queue<packet_t>(mail::video_packets),
+        mail::man->queue<packet_t>(mail::video_packets_name(config.stream_index)),
         std::move(idr_events),
         mail->event<hdr_info_t>(mail::hdr),
         mail->event<input::touch_port_t>(mail::touch_port),
@@ -2957,6 +2990,55 @@ namespace video {
 
       // Wait for join signal
       join_event.view();
+    }
+  }
+
+  void capture_multi_region(
+    safe::mail_t mail,
+    config_t config,
+    void *channel_data,
+    int num_streams,
+    int per_monitor_width,
+    int per_monitor_height
+  ) {
+    auto *encoder = chosen_encoder;
+    if (!encoder) {
+      BOOST_LOG(error) << "No encoder available for multi-region capture"sv;
+      return;
+    }
+
+    BOOST_LOG(info) << "Multi-region capture: " << num_streams << " streams, "
+                    << per_monitor_width << "x" << per_monitor_height << " each"
+                    << " from combined " << config.width << "x" << config.height;
+
+    // Each stream gets its own capture() call with per-monitor dimensions.
+    // The display is created at the full combined resolution, but each encoder
+    // operates at per-monitor resolution. The captureThread's push_callback
+    // will crop the combined frame to the appropriate region for each stream.
+
+    std::vector<std::thread> stream_threads;
+
+    for (int i = 1; i < num_streams; i++) {
+      config_t stream_config = config;
+      stream_config.stream_index = i;
+      // Set encoder dimensions to per-monitor (NOT combined)
+      stream_config.width = per_monitor_width;
+      stream_config.height = per_monitor_height;
+
+      stream_threads.emplace_back([mail, cfg = std::move(stream_config), channel_data]() {
+        capture(mail, cfg, channel_data);
+      });
+    }
+
+    // Stream 0 runs on this thread
+    config_t stream0_config = config;
+    stream0_config.stream_index = 0;
+    stream0_config.width = per_monitor_width;
+    stream0_config.height = per_monitor_height;
+    capture(mail, stream0_config, channel_data);
+
+    for (auto &t : stream_threads) {
+      if (t.joinable()) t.join();
     }
   }
 
