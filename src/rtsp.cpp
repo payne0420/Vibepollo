@@ -906,6 +906,7 @@ namespace rtsp_stream {
     // Report supported and required encryption flags
     ss << "a=x-ss-general.encryptionSupported:" << encryption_flags_supported << std::endl;
     ss << "a=x-ss-general.encryptionRequested:" << encryption_flags_requested << std::endl;
+    ss << "a=x-ss-general.multiStreamSupported:1" << std::endl;
 
     if (video::last_encoder_probe_supported_ref_frames_invalidation) {
       ss << "a=x-nv-video[0].refPicInvalidation:1"sv << std::endl;
@@ -1161,6 +1162,15 @@ namespace rtsp_stream {
       config.videoStreamDisplayNames.clear();
       for (const auto &vd : session.video_displays) {
         config.videoStreamDisplayNames.push_back(vd.display_name);
+      }
+
+      // Fallback for resume: if video_displays is empty (VD creation was skipped),
+      // populate display names from the multi-monitor runtime state.
+      if (config.videoStreamDisplayNames.empty() && config.numVideoStreams > 1) {
+        auto mm_state = config::get_multi_monitor_state();
+        for (const auto &dev_id : mm_state.display_device_ids) {
+          config.videoStreamDisplayNames.push_back(dev_id);
+        }
       }
 
       // Validate that clientRefreshRateX100 is consistent with maxFPS.

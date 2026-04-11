@@ -397,6 +397,11 @@ namespace stream {
     std::vector<std::unique_ptr<udp::socket>> video_socks;  // One per video stream
     udp::socket audio_sock {io_context};
 
+    // Per-stream video peer endpoints, populated when pings arrive on each video socket.
+    // Indexed by video socket index (0..video_socks.size()-1).
+    std::mutex video_peers_mutex;
+    udp::endpoint video_peers[MAX_VIDEO_STREAMS];
+
     control_server_t control_server;
   };
 
@@ -423,6 +428,11 @@ namespace stream {
 
       int lowseq;
       udp::endpoint peer;
+
+      // Per-stream peer endpoints for multi-stream video.
+      // Populated by recvThread when pings arrive on each video socket.
+      // stream_peers[0] == peer (primary stream).
+      udp::endpoint stream_peers[MAX_VIDEO_STREAMS];
 
       std::optional<crypto::cipher::gcm_t> cipher;
       std::uint64_t gcm_iv_counter;
@@ -1482,8 +1492,8 @@ namespace stream {
       }
     };
 
-    auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session, std::string_view type_str) {
-      recv_func[buf_elem] = [&, buf_elem, type_str](const boost::system::error_code &ec, size_t bytes) {
+    auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session, std::string_view type_str, int video_stream_idx) {
+      recv_func[buf_elem] = [&, buf_elem, type_str, video_stream_idx](const boost::system::error_code &ec, size_t bytes) {
         auto fg = util::fail_guard([&]() {
           sock.async_receive_from(asio::buffer(buf[buf_elem]), peer, 0, recv_func[buf_elem]);
         });
@@ -1500,6 +1510,12 @@ namespace stream {
         if (ec || !bytes) {
           BOOST_LOG(error) << "Couldn't receive data from udp socket: "sv << ec.message();
           return;
+        }
+
+        // For video sockets, record the per-stream peer endpoint
+        if (video_stream_idx >= 0 && video_stream_idx < MAX_VIDEO_STREAMS) {
+          std::lock_guard<std::mutex> lock(ctx.video_peers_mutex);
+          ctx.video_peers[video_stream_idx] = peer;
         }
 
         if (bytes == 4) {
@@ -1522,9 +1538,9 @@ namespace stream {
 
     // Initialize receive handlers for all video sockets
     for (int i = 0; i < num_video; i++) {
-      recv_func_init(*ctx.video_socks[i], i, peer_to_video_session, "VIDEO"sv);
+      recv_func_init(*ctx.video_socks[i], i, peer_to_video_session, "VIDEO"sv, i);
     }
-    recv_func_init(audio_sock, audio_idx, peer_to_audio_session, "AUDIO"sv);
+    recv_func_init(audio_sock, audio_idx, peer_to_audio_session, "AUDIO"sv, -1);
 
     // Start async receives on all sockets
     for (int i = 0; i < num_video; i++) {
@@ -1537,7 +1553,7 @@ namespace stream {
     }
   }
 
-  void videoBroadcastThread(udp::socket &sock, int stream_index) {
+  void videoBroadcastThread(udp::socket &sock, int stream_index, broadcast_ctx_t &bctx) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets_name(stream_index));
     auto video_epoch = std::chrono::steady_clock::now();
@@ -1724,7 +1740,18 @@ namespace stream {
           auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
           frame_fec_latency_logger.second_point_now_and_log();
 
-          auto peer_address = session->video.peer.address();
+          // Use per-stream peer endpoint if available, fall back to primary
+          udp::endpoint stream_peer;
+          {
+            std::lock_guard<std::mutex> lock(bctx.video_peers_mutex);
+            stream_peer = bctx.video_peers[stream_index];
+          }
+          if (stream_peer.port() == 0) {
+            // Fallback: no ping received on this stream yet, use primary peer
+            stream_peer = session->video.peer;
+          }
+
+          auto peer_address = stream_peer.address();
           auto batch_info = platf::batched_send_info_t {
             shards.headers.begin(),
             shards.prefixsize,
@@ -1734,7 +1761,7 @@ namespace stream {
             0,
             (uintptr_t) sock.native_handle(),
             peer_address,
-            session->video.peer.port(),
+            stream_peer.port(),
             session->localAddress,
           };
 
@@ -1827,7 +1854,7 @@ namespace stream {
                     shards.blocksize,
                     (uintptr_t) sock.native_handle(),
                     peer_address,
-                    session->video.peer.port(),
+                    stream_peer.port(),
                     session->localAddress,
                   };
 
@@ -1993,16 +2020,11 @@ namespace stream {
       return -1;
     }
 
-    // Determine number of video streams to bind sockets for.
-    // For now, check if any pending session requests multi-stream; default to 1.
-    int num_video_streams = 1;
-    auto mm_state = config::get_multi_monitor_state();
-    if (mm_state.monitor_count > 1) {
-      num_video_streams = mm_state.monitor_count;
-    }
-    if (num_video_streams > MAX_VIDEO_STREAMS) {
-      num_video_streams = MAX_VIDEO_STREAMS;
-    }
+    // Always bind MAX_VIDEO_STREAMS sockets so the broadcast context doesn't
+    // need to be torn down and recreated when switching between single-stream
+    // and multi-stream sessions. Unused sockets are harmless (broadcast threads
+    // just block on empty queues).
+    int num_video_streams = MAX_VIDEO_STREAMS;
 
     // Bind N video sockets
     ctx.video_socks.clear();
@@ -2067,7 +2089,7 @@ namespace stream {
     // Start broadcast threads -- one per video socket, plus audio and control
     ctx.video_threads.clear();
     for (int i = 0; i < (int) ctx.video_socks.size(); i++) {
-      ctx.video_threads.emplace_back(videoBroadcastThread, std::ref(*ctx.video_socks[i]), i);
+      ctx.video_threads.emplace_back(videoBroadcastThread, std::ref(*ctx.video_socks[i]), i, std::ref(ctx));
     }
     ctx.audio_thread = std::thread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::thread {controlBroadcastThread, &ctx.control_server};

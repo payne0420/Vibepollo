@@ -552,6 +552,14 @@ namespace nvhttp {
           launch_session->video_displays.clear();
           bool all_vds_created = true;
 
+          // Tear down any leftover virtual displays from previous sessions before
+          // creating new ones. This prevents the per-display teardown inside
+          // createVirtualDisplay from destroying sibling displays we just created
+          // (each sibling has a different GUID, so it would be treated as "conflicting").
+          if (num_vds > 1) {
+            VDISPLAY::removeAllVirtualDisplays();
+          }
+
           for (int vd_idx = 0; vd_idx < num_vds; vd_idx++) {
             // Generate a unique GUID for each virtual display by incrementing the last byte
             GUID vd_guid = virtual_display_guid;
@@ -572,7 +580,8 @@ namespace nvhttp {
               vd_fps,
               vd_guid,
               base_vd_fps_millihz,
-              framegen_refresh_active
+              framegen_refresh_active,
+              /*skip_teardown=*/num_vds > 1
             );
 
             rtsp_stream::launch_session_t::per_display_info_t vdi;
@@ -634,11 +643,8 @@ namespace nvhttp {
             recovery_params.client_uid = display_uuid_source;
             recovery_params.client_name = client_label;
             recovery_params.hdr_profile = launch_session->hdr_profile;
-            recovery_params.display_name = display_info->display_name;
-            recovery_params.monitor_device_path = display_info->monitor_device_path;
-            if (display_info->device_id && !display_info->device_id->empty()) {
-              recovery_params.device_id = *display_info->device_id;
-            } else if (!launch_session->virtual_display_device_id.empty()) {
+            // Use primary VD info from video_displays[0] for recovery
+            if (!launch_session->virtual_display_device_id.empty()) {
               recovery_params.device_id = launch_session->virtual_display_device_id;
             }
             recovery_params.max_attempts = 3;

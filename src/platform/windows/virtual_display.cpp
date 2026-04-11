@@ -3252,7 +3252,8 @@ namespace VDISPLAY {
       uint32_t fps,
       const GUID &guid,
       uint32_t base_fps_millihz,
-      bool framegen_refresh_active
+      bool framegen_refresh_active,
+      bool skip_teardown
     ) {
       if (SUDOVDA_DRIVER_HANDLE == INVALID_HANDLE_VALUE) {
         return std::nullopt;
@@ -3268,9 +3269,11 @@ namespace VDISPLAY {
                        << "' width=" << width << " height=" << height << " fps=" << fps
                        << " guid=" << requested_uuid.string();
 
-      teardown_conflicting_virtual_displays(requested_uuid);
-      BOOST_LOG(debug) << "teardown_conflicting_virtual_displays completed for guid=" << requested_uuid.string();
-      enforce_teardown_cooldown_if_needed();
+      if (!skip_teardown) {
+        teardown_conflicting_virtual_displays(requested_uuid);
+        BOOST_LOG(debug) << "teardown_conflicting_virtual_displays completed for guid=" << requested_uuid.string();
+        enforce_teardown_cooldown_if_needed();
+      }
 
       const uint32_t requested_fps = apply_refresh_overrides(fps, base_fps_millihz, framegen_refresh_active);
       VIRTUAL_DISPLAY_ADD_OUT output {};
@@ -3475,7 +3478,8 @@ namespace VDISPLAY {
     uint32_t fps,
     const GUID &guid,
     uint32_t base_fps_millihz,
-    bool framegen_refresh_active
+    bool framegen_refresh_active,
+    bool skip_teardown
   ) {
     constexpr int kMaxInitializationAttempts = 3;
     const auto requested_uuid = guid_to_uuid(guid);
@@ -3497,7 +3501,8 @@ namespace VDISPLAY {
         fps,
         guid,
         base_fps_millihz,
-        framegen_refresh_active
+        framegen_refresh_active,
+        skip_teardown
       );
       if (!result) {
         BOOST_LOG(warning) << "Virtual display creation attempt " << attempt << '/' << kMaxInitializationAttempts

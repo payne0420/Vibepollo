@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bitset>
 #include <chrono>
@@ -760,6 +761,45 @@ namespace video {
   auto capture_thread_async = safe::make_shared<capture_thread_async_ctx_t>(start_capture_async, end_capture_async);
   auto capture_thread_sync = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync, end_capture_sync);
 
+  // Per-stream capture contexts for multi-monitor (streams 1+).
+  // Stream 0 uses the globals above. Additional streams are lazily created here.
+  constexpr int kMaxVideoStreams = 4;
+  void captureThreadSyncForStream(safe::shared_t<capture_thread_sync_ctx_t> &sync_ctx);
+
+  std::mutex per_stream_capture_mutex;
+  std::array<std::unique_ptr<safe::shared_t<capture_thread_sync_ctx_t>>, kMaxVideoStreams> per_stream_sync;
+  std::array<std::unique_ptr<safe::shared_t<capture_thread_async_ctx_t>>, kMaxVideoStreams> per_stream_async;
+
+  safe::shared_t<capture_thread_sync_ctx_t> &
+  get_capture_sync(int stream_index) {
+    if (stream_index == 0) return capture_thread_sync;
+    std::lock_guard lg(per_stream_capture_mutex);
+    if (!per_stream_sync[stream_index]) {
+      per_stream_sync[stream_index] = std::make_unique<safe::shared_t<capture_thread_sync_ctx_t>>(
+        [stream_index](capture_thread_sync_ctx_t &) -> int {
+          std::thread([stream_index]() {
+            captureThreadSyncForStream(*per_stream_sync[stream_index]);
+          }).detach();
+          return 0;
+        },
+        [](capture_thread_sync_ctx_t &) {}
+      );
+    }
+    return *per_stream_sync[stream_index];
+  }
+
+  safe::shared_t<capture_thread_async_ctx_t> &
+  get_capture_async(int stream_index) {
+    if (stream_index == 0) return capture_thread_async;
+    std::lock_guard lg(per_stream_capture_mutex);
+    if (!per_stream_async[stream_index]) {
+      per_stream_async[stream_index] = std::make_unique<safe::shared_t<capture_thread_async_ctx_t>>(
+        start_capture_async, end_capture_async
+      );
+    }
+    return *per_stream_async[stream_index];
+  }
+
 #ifdef _WIN32
   encoder_t nvenc {
     "nvenc"sv,
@@ -1504,6 +1544,20 @@ namespace video {
         continue;
       }
 
+      // Multi-stream: if the capture context has a display_name_override, target
+      // that specific display instead of the default selection.
+      if (!capture_ctxs.empty()) {
+        const auto &override_name = capture_ctxs.front().config.display_name_override;
+        if (!override_name.empty()) {
+          for (int x = 0; x < (int) display_names.size(); ++x) {
+            if (boost::iequals(display_names[x], override_name)) {
+              display_p = x;
+              break;
+            }
+          }
+        }
+      }
+
       disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
       if (disp) {
         break;
@@ -1728,6 +1782,19 @@ namespace video {
                 const int requested = *switch_display_event->pop();
                 if (requested >= 0) {
                   display_p = std::clamp(requested, 0, (int) display_names.size() - 1);
+                }
+              }
+
+              // Multi-stream: apply per-stream display override after refresh
+              if (!capture_ctxs.empty()) {
+                const auto &override_name = capture_ctxs.front().config.display_name_override;
+                if (!override_name.empty()) {
+                  for (int x = 0; x < (int) display_names.size(); ++x) {
+                    if (boost::iequals(display_names[x], override_name)) {
+                      display_p = x;
+                      break;
+                    }
+                  }
                 }
               }
 
@@ -2640,6 +2707,20 @@ namespace video {
         }
       }
 
+      // Multi-stream: if the session has a display_name_override, target that specific
+      // display instead of the default. Each per-stream capture context captures its own VD.
+      if (!synced_session_ctxs.empty()) {
+        const auto &override_name = synced_session_ctxs.front()->config.display_name_override;
+        if (!override_name.empty()) {
+          for (int x = 0; x < (int) display_names.size(); ++x) {
+            if (boost::iequals(display_names[x], override_name)) {
+              display_p = x;
+              break;
+            }
+          }
+        }
+      }
+
       // reset_display() will sleep between retries
       reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], synced_session_ctxs.front()->config);
       if (disp) {
@@ -2789,8 +2870,8 @@ namespace video {
     return encode_e::ok;
   }
 
-  void captureThreadSync() {
-    auto ref = capture_thread_sync.ref();
+  void captureThreadSyncImpl(safe::shared_t<capture_thread_sync_ctx_t> &sync_ctx) {
+    auto ref = sync_ctx.ref();
 
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;
 
@@ -2817,10 +2898,19 @@ namespace video {
     while (encode_run_sync(synced_session_ctxs, ctx, display_names, display_p) == encode_e::reinit) {}
   }
 
+  void captureThreadSync() {
+    captureThreadSyncImpl(capture_thread_sync);
+  }
+
+  void captureThreadSyncForStream(safe::shared_t<capture_thread_sync_ctx_t> &sync_ctx) {
+    captureThreadSyncImpl(sync_ctx);
+  }
+
   void capture_async(
     safe::mail_t mail,
     config_t &config,
-    void *channel_data
+    void *channel_data,
+    safe::shared_t<capture_thread_async_ctx_t> &async_ctx
   ) {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
 
@@ -2830,7 +2920,7 @@ namespace video {
       shutdown_event->raise(true);
     });
 
-    auto ref = capture_thread_async.ref();
+    auto ref = async_ctx.ref();
     if (!ref) {
       return;
     }
@@ -2922,10 +3012,11 @@ namespace video {
 
     idr_events->raise(true);
     if (encoder->flags & PARALLEL_ENCODING) {
-      capture_async(std::move(mail), config, channel_data);
+      auto &async_ctx = get_capture_async(config.stream_index);
+      capture_async(std::move(mail), config, channel_data, async_ctx);
     } else {
       safe::signal_t join_event;
-      auto ref = capture_thread_sync.ref();
+      auto ref = get_capture_sync(config.stream_index).ref();
       ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
         &join_event,
         mail->event<bool>(mail::shutdown),
@@ -3182,8 +3273,15 @@ namespace video {
 
       // Reset the display since we're switching from SDR to HDR. Keep probing on the
       // current active display without attempting a display swap.
-      // Clear the cache since we need a fresh display for HDR testing
+      // Fully destroy the old display before creating the new one.
+      // The WGC IPC display has background threads and Windows thread-pool
+      // callbacks that may still be in-flight when the shared_ptr destructor
+      // runs.  Releasing both references first ensures the destructor fires
+      // before we ask DXGI for a new factory, avoiding a race where a stale
+      // callback jumps through a zeroed-out vtable (crash at RIP=0x0).
       cached_probe_display.reset();
+      disp.reset();
+      std::this_thread::sleep_for(std::chrono::milliseconds {50});
       reset_display(disp, encoder.platform_formats->dev_type, probe_display_name, generic_hdr_config);
       if (!disp) {
         return false;
