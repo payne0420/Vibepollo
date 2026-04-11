@@ -3279,11 +3279,14 @@ namespace video {
 
       const config_t generic_hdr_config = {1920, 1080, 60, 6000, 1000, 1, 0, 3, 1, 1, 0};
 
-      // Reset the display since we're switching from SDR to HDR. Keep probing on the
-      // current active display without attempting a display swap.
-      // Clear the cache since we need a fresh display for HDR testing
+      // Create a new display for HDR probing. Keep the old display alive in
+      // `old_disp` until the new one is ready — this prevents the WGC IPC
+      // destructor from firing while Windows thread-pool callbacks are still
+      // in flight. The old display is released after the new one is established.
       cached_probe_display.reset();
+      auto old_disp = std::move(disp);
       reset_display(disp, encoder.platform_formats->dev_type, probe_display_name, generic_hdr_config);
+      old_disp.reset();  // Now safe — new display owns the capture session
       if (!disp) {
         return false;
       }

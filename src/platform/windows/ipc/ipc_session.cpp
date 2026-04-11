@@ -80,10 +80,17 @@ namespace platf::dxgi {
         _frame_queue_pipe.reset();
       }
 
+      // Terminate helper process and wait for it to exit.
+      stop_helper_process();
+
+      // Wait for Windows-internal thread-pool callbacks (DXGI/composition) to
+      // drain before releasing shared resources. These callbacks run inside the
+      // main process and may still reference the shared texture/keyed mutex.
+      // Without this, a stale callback can jump through a zeroed vtable (RIP=0x0).
+      Sleep(100);
+
       _shared_texture = nullptr;
       _keyed_mutex = nullptr;
-
-      stop_helper_process();
     } catch (...) {
       // Intentionally swallow all exceptions.
     }
