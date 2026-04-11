@@ -2176,8 +2176,45 @@ namespace stream {
     auto address = session->video.peer.address();
     session->video.qos = platf::enable_socket_qos(ref->video_socks[0]->native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
-    BOOST_LOG(debug) << "Start capturing Video"sv;
-    video::capture(session->mail, session->config.monitor, session);
+    const int num_streams = session->config.numVideoStreams;
+
+    if (num_streams <= 1) {
+      // Single stream: existing behavior
+      BOOST_LOG(debug) << "Start capturing Video (single stream)"sv;
+      video::capture(session->mail, session->config.monitor, session);
+    } else {
+      // Multi-stream: spawn N capture threads, one per virtual display
+      BOOST_LOG(info) << "Start capturing Video (" << num_streams << " streams)"sv;
+
+      std::vector<std::thread> capture_threads;
+
+      for (int i = 1; i < num_streams; i++) {
+        video::config_t per_stream_config = session->config.monitor;
+        if (i < (int) session->config.videoStreamDisplayNames.size()) {
+          per_stream_config.display_name_override = session->config.videoStreamDisplayNames[i];
+        }
+        per_stream_config.stream_index = i;
+
+        capture_threads.emplace_back([mail = session->mail, cfg = std::move(per_stream_config), session]() {
+          BOOST_LOG(info) << "Capture thread for stream " << cfg.stream_index
+                          << " targeting display: " << cfg.display_name_override;
+          video::capture(mail, cfg, session);
+        });
+      }
+
+      // Stream 0 runs on this thread
+      auto stream0_config = session->config.monitor;
+      if (!session->config.videoStreamDisplayNames.empty()) {
+        stream0_config.display_name_override = session->config.videoStreamDisplayNames[0];
+      }
+      stream0_config.stream_index = 0;
+      video::capture(session->mail, stream0_config, session);
+
+      // Wait for additional capture threads to finish
+      for (auto &t : capture_threads) {
+        if (t.joinable()) t.join();
+      }
+    }
   }
 
   void audioThread(session_t *session) {

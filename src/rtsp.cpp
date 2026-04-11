@@ -1156,6 +1156,13 @@ namespace rtsp_stream {
 
       config.monitor.input_only = session.input_only;
 
+      // Multi-stream: populate per-stream display names from VD creation results
+      config.numVideoStreams = session.num_video_streams;
+      config.videoStreamDisplayNames.clear();
+      for (const auto &vd : session.video_displays) {
+        config.videoStreamDisplayNames.push_back(vd.display_name);
+      }
+
       // Validate that clientRefreshRateX100 is consistent with maxFPS.
       // Some clients send a stale or incorrect clientRefreshRateX100 (e.g. 6000 = 60fps)
       // while requesting a higher maxFPS (e.g. 120). Since framerateX100 unconditionally

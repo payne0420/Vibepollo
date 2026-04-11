@@ -52,6 +52,10 @@ namespace video {
 
     int encodingFramerate;  // Requested display framerate
     bool input_only;
+
+    // Multi-stream: if non-empty, capture from this display instead of the global config output
+    std::string display_name_override;
+    int stream_index = 0;  // Which video stream this capture produces (0 = primary)
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
