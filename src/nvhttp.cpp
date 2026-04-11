@@ -546,33 +546,83 @@ namespace nvhttp {
           }
           VDISPLAY::setWatchdogFeedingEnabled(true);
           const char *hdr_profile = launch_session->hdr_profile ? launch_session->hdr_profile->c_str() : nullptr;
-          auto display_info = VDISPLAY::createVirtualDisplay(
-            display_uuid_source.c_str(),
-            client_label.c_str(),
-            hdr_profile,
-            vd_width,
-            vd_height,
-            vd_fps,
-            virtual_display_guid,
-            base_vd_fps_millihz,
-            framegen_refresh_active
-          );
-          if (display_info) {
+
+          // Create N virtual displays (1 per video stream)
+          const int num_vds = launch_session->num_video_streams;
+          launch_session->video_displays.clear();
+          bool all_vds_created = true;
+
+          for (int vd_idx = 0; vd_idx < num_vds; vd_idx++) {
+            // Generate a unique GUID for each virtual display by incrementing the last byte
+            GUID vd_guid = virtual_display_guid;
+            reinterpret_cast<uint8_t *>(&vd_guid)[15] += static_cast<uint8_t>(vd_idx);
+
+            // Differentiate client labels for multi-monitor
+            std::string vd_label = client_label;
+            if (num_vds > 1) {
+              vd_label += " (Monitor " + std::to_string(vd_idx + 1) + ")";
+            }
+
+            auto display_info = VDISPLAY::createVirtualDisplay(
+              display_uuid_source.c_str(),
+              vd_label.c_str(),
+              hdr_profile,
+              vd_width,
+              vd_height,
+              vd_fps,
+              vd_guid,
+              base_vd_fps_millihz,
+              framegen_refresh_active
+            );
+
+            rtsp_stream::launch_session_t::per_display_info_t vdi;
+            std::memcpy(vdi.guid_bytes.data(), &vd_guid, sizeof(vd_guid));
+
+            if (display_info) {
+              if (display_info->device_id && !display_info->device_id->empty()) {
+                vdi.device_id = *display_info->device_id;
+              } else if (auto resolved = VDISPLAY::resolveVirtualDisplayDeviceIdForClient(vd_label)) {
+                vdi.device_id = *resolved;
+              }
+              if (display_info->display_name) {
+                vdi.display_name = platf::to_utf8(*display_info->display_name);
+              }
+              vdi.ready_since = display_info->ready_since;
+
+              BOOST_LOG(info) << "Virtual display " << (vd_idx + 1) << "/" << num_vds
+                              << " created" << (vdi.display_name.empty() ? "" : " at " + vdi.display_name);
+            } else {
+              BOOST_LOG(warning) << "Virtual display " << (vd_idx + 1) << "/" << num_vds << " creation failed.";
+              all_vds_created = false;
+            }
+
+            launch_session->video_displays.push_back(std::move(vdi));
+          }
+
+          // Populate primary VD fields for backward compat
+          if (!launch_session->video_displays.empty() && !launch_session->video_displays[0].device_id.empty()) {
             launch_session->virtual_display = true;
             launch_session->virtual_display_failed = false;
-            if (display_info->device_id && !display_info->device_id->empty()) {
-              launch_session->virtual_display_device_id = *display_info->device_id;
-            } else if (auto resolved_device = VDISPLAY::resolveVirtualDisplayDeviceIdForClient(client_label)) {
-              launch_session->virtual_display_device_id = *resolved_device;
-            } else {
-              launch_session->virtual_display_device_id.clear();
+            launch_session->virtual_display_device_id = launch_session->video_displays[0].device_id;
+            launch_session->virtual_display_ready_since = launch_session->video_displays[0].ready_since;
+          } else if (!all_vds_created) {
+            launch_session->virtual_display_failed = true;
+          }
+
+          // Set multi-monitor runtime state
+          if (num_vds > 1) {
+            config::multi_monitor_state_t mm;
+            mm.monitor_count = num_vds;
+            mm.per_monitor_width = static_cast<int>(vd_width);
+            mm.per_monitor_height = static_cast<int>(vd_height);
+            for (const auto &vd : launch_session->video_displays) {
+              mm.display_device_ids.push_back(vd.device_id);
             }
-            launch_session->virtual_display_ready_since = display_info->ready_since;
-            if (display_info->display_name && !display_info->display_name->empty()) {
-              BOOST_LOG(info) << "Virtual display created at " << platf::to_utf8(*display_info->display_name);
-            } else {
-              BOOST_LOG(info) << "Virtual display created (device name pending enumeration).";
-            }
+            config::set_multi_monitor_state(mm);
+          }
+
+          // Set up recovery monitor for primary VD only
+          if (launch_session->virtual_display) {
 
             VDISPLAY::VirtualDisplayRecoveryParams recovery_params;
             recovery_params.guid = virtual_display_guid;
