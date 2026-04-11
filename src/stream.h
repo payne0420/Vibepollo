@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 // lib includes
 #include <boost/asio.hpp>
@@ -23,6 +24,19 @@ namespace stream {
   constexpr auto VIDEO_STREAM_PORT = 9;
   constexpr auto CONTROL_PORT = 10;
   constexpr auto AUDIO_STREAM_PORT = 11;
+
+  // Maximum number of independent video streams (monitors)
+  constexpr auto MAX_VIDEO_STREAMS = 4;
+
+  /**
+   * @brief Get the port offset for video stream at the given index.
+   * Stream 0 uses VIDEO_STREAM_PORT (9). Additional streams use 12, 14, 16, ...
+   * This leaves CONTROL_PORT (10) and AUDIO_STREAM_PORT (11) untouched.
+   */
+  constexpr int
+  video_stream_port(int stream_index) {
+    return stream_index == 0 ? VIDEO_STREAM_PORT : (VIDEO_STREAM_PORT + 3 + 2 * (stream_index - 1));
+  }
 
   struct session_t;
 
@@ -46,6 +60,9 @@ namespace stream {
     std::string frame_generation_provider;
     std::optional<double> lossless_scaling_target_fps;
     std::optional<int> lossless_scaling_rtss_limit;
+
+    int numVideoStreams = 1;
+    std::vector<std::string> videoStreamDisplayNames;  // One display name per video stream
   };
 
   namespace session {

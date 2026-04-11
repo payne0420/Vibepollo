@@ -52,6 +52,10 @@ namespace video {
 
     int encodingFramerate;  // Requested display framerate
     bool input_only;
+
+    // Multi-stream fields (appended per the big warning above)
+    std::string display_name_override;  // Target a specific display by name
+    int stream_index = 0;  // Which stream this config belongs to
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);

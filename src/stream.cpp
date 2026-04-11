@@ -388,14 +388,18 @@ namespace stream {
     message_queue_queue_t message_queue_queue;
 
     std::thread recv_thread;
-    std::thread video_thread;
+    std::vector<std::thread> video_threads;  // One per video stream
     std::thread audio_thread;
     std::thread control_thread;
 
     asio::io_context io_context;
 
-    udp::socket video_sock {io_context};
+    std::vector<std::unique_ptr<udp::socket>> video_socks;  // One per video stream
     udp::socket audio_sock {io_context};
+
+    // Per-stream video peer endpoints, populated when pings arrive on each video socket.
+    std::mutex video_peers_mutex;
+    udp::endpoint video_peers[MAX_VIDEO_STREAMS];
 
     control_server_t control_server;
   };
@@ -423,6 +427,9 @@ namespace stream {
 
       int lowseq;
       udp::endpoint peer;
+
+      // Per-stream peer endpoints for multi-stream video.
+      udp::endpoint stream_peers[MAX_VIDEO_STREAMS];
 
       std::optional<crypto::cipher::gcm_t> cipher;
       std::uint64_t gcm_iv_counter;
@@ -1441,7 +1448,6 @@ namespace stream {
     std::map<av_session_id_t, message_queue_t> peer_to_video_session;
     std::map<av_session_id_t, message_queue_t> peer_to_audio_session;
 
-    auto &video_sock = ctx.video_sock;
     auto &audio_sock = ctx.audio_sock;
 
     auto &message_queue_queue = ctx.message_queue_queue;
@@ -1451,8 +1457,13 @@ namespace stream {
 
     udp::endpoint peer;
 
-    std::array<char, 2048> buf[2];
-    std::function<void(const boost::system::error_code, size_t)> recv_func[2];
+    // N video sockets + 1 audio socket
+    const int num_video = (int) ctx.video_socks.size();
+    const int total_sockets = num_video + 1;
+    const int audio_idx = num_video;  // audio is the last element
+
+    std::vector<std::array<char, 2048>> buf(total_sockets);
+    std::vector<std::function<void(const boost::system::error_code, size_t)>> recv_func(total_sockets);
 
     auto populate_peer_to_session = [&]() {
       while (message_queue_queue->peek()) {
@@ -1478,13 +1489,12 @@ namespace stream {
       }
     };
 
-    auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session) {
-      recv_func[buf_elem] = [&, buf_elem](const boost::system::error_code &ec, size_t bytes) {
+    auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session, std::string_view type_str, int video_stream_idx) {
+      recv_func[buf_elem] = [&, buf_elem, type_str, video_stream_idx](const boost::system::error_code &ec, size_t bytes) {
         auto fg = util::fail_guard([&]() {
           sock.async_receive_from(asio::buffer(buf[buf_elem]), peer, 0, recv_func[buf_elem]);
         });
 
-        auto type_str = buf_elem ? "AUDIO"sv : "VIDEO"sv;
         BOOST_LOG(verbose) << "Recv: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
 
         populate_peer_to_session();
@@ -1497,6 +1507,12 @@ namespace stream {
         if (ec || !bytes) {
           BOOST_LOG(error) << "Couldn't receive data from udp socket: "sv << ec.message();
           return;
+        }
+
+        // For video sockets, record the per-stream peer endpoint
+        if (video_stream_idx >= 0 && video_stream_idx < MAX_VIDEO_STREAMS) {
+          std::lock_guard<std::mutex> lock(ctx.video_peers_mutex);
+          ctx.video_peers[video_stream_idx] = peer;
         }
 
         if (bytes == 4) {
@@ -1517,20 +1533,26 @@ namespace stream {
       };
     };
 
-    recv_func_init(video_sock, 0, peer_to_video_session);
-    recv_func_init(audio_sock, 1, peer_to_audio_session);
+    // Initialize receive handlers for all video sockets
+    for (int i = 0; i < num_video; i++) {
+      recv_func_init(*ctx.video_socks[i], i, peer_to_video_session, "VIDEO"sv, i);
+    }
+    recv_func_init(audio_sock, audio_idx, peer_to_audio_session, "AUDIO"sv, -1);
 
-    video_sock.async_receive_from(asio::buffer(buf[0]), peer, 0, recv_func[0]);
-    audio_sock.async_receive_from(asio::buffer(buf[1]), peer, 0, recv_func[1]);
+    // Start async receives on all sockets
+    for (int i = 0; i < num_video; i++) {
+      ctx.video_socks[i]->async_receive_from(asio::buffer(buf[i]), peer, 0, recv_func[i]);
+    }
+    audio_sock.async_receive_from(asio::buffer(buf[audio_idx]), peer, 0, recv_func[audio_idx]);
 
     while (!broadcast_shutdown_event->peek()) {
       io.run();
     }
   }
 
-  void videoBroadcastThread(udp::socket &sock) {
+  void videoBroadcastThread(udp::socket &sock, int stream_index, broadcast_ctx_t &bctx) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
-    auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    auto packets = mail::man->queue<video::packet_t>(mail::video_packets_name(stream_index));
     auto video_epoch = std::chrono::steady_clock::now();
 
     // Video traffic is sent on this thread
@@ -1715,7 +1737,17 @@ namespace stream {
           auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
           frame_fec_latency_logger.second_point_now_and_log();
 
-          auto peer_address = session->video.peer.address();
+          // Use per-stream peer endpoint if available, fall back to primary
+          udp::endpoint stream_peer;
+          {
+            std::lock_guard<std::mutex> lock(bctx.video_peers_mutex);
+            stream_peer = bctx.video_peers[stream_index];
+          }
+          if (stream_peer.port() == 0) {
+            stream_peer = session->video.peer;
+          }
+
+          auto peer_address = stream_peer.address();
           auto batch_info = platf::batched_send_info_t {
             shards.headers.begin(),
             shards.prefixsize,
@@ -1725,7 +1757,7 @@ namespace stream {
             0,
             (uintptr_t) sock.native_handle(),
             peer_address,
-            session->video.peer.port(),
+            stream_peer.port(),
             session->localAddress,
           };
 
@@ -1818,7 +1850,7 @@ namespace stream {
                     shards.blocksize,
                     (uintptr_t) sock.native_handle(),
                     peer_address,
-                    session->video.peer.port(),
+                    stream_peer.port(),
                     session->localAddress,
                   };
 
@@ -1973,17 +2005,9 @@ namespace stream {
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     broadcast_shutdown_event->reset();
 
-    // Reset the packet queues which were stopped in end_broadcast.
-    // If not reset, the broadcast threads will exit immediately when pop() returns null.
-    auto video_packets = mail::man->queue<video::packet_t>(mail::video_packets);
-    auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
-    video_packets->reset();
-    audio_packets->reset();
-
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
     auto protocol = address_family == net::IPV4 ? udp::v4() : udp::v6();
     auto control_port = net::map_port(CONTROL_PORT);
-    auto video_port = net::map_port(VIDEO_STREAM_PORT);
     auto audio_port = net::map_port(AUDIO_STREAM_PORT);
 
     if (ctx.control_server.bind(address_family, control_port)) {
@@ -1992,28 +2016,40 @@ namespace stream {
       return -1;
     }
 
+    // Always bind MAX_VIDEO_STREAMS sockets so the broadcast context doesn't
+    // need to be torn down and recreated when switching between single-stream
+    // and multi-stream sessions.
+    int num_video_streams = MAX_VIDEO_STREAMS;
+
+    ctx.video_socks.clear();
+    for (int i = 0; i < num_video_streams; i++) {
+      auto video_port = net::map_port(video_stream_port(i));
+
+      auto sock = std::make_unique<udp::socket>(ctx.io_context);
+      boost::system::error_code ec;
+      sock->open(protocol, ec);
+      if (ec) {
+        BOOST_LOG(fatal) << "Couldn't open socket for Video server [" << i << "]: "sv << ec.message();
+        return -1;
+      }
+
+      try {
+        sock->set_option(boost::asio::socket_base::send_buffer_size(1024 * 1024));
+      } catch (...) {
+        BOOST_LOG(error) << "Failed to set video socket send buffer size (SO_SENDBUF) for stream " << i;
+      }
+
+      sock->bind(udp::endpoint(protocol, video_port), ec);
+      if (ec) {
+        BOOST_LOG(fatal) << "Couldn't bind Video server [" << i << "] to port ["sv << video_port << "]: "sv << ec.message();
+        return -1;
+      }
+
+      ctx.video_socks.push_back(std::move(sock));
+      BOOST_LOG(info) << "Video stream " << i << " bound to port " << video_port;
+    }
+
     boost::system::error_code ec;
-    ctx.video_sock.open(protocol, ec);
-    if (ec) {
-      BOOST_LOG(fatal) << "Couldn't open socket for Video server: "sv << ec.message();
-
-      return -1;
-    }
-
-    // Set video socket send buffer size (SO_SENDBUF) to 1MB
-    try {
-      ctx.video_sock.set_option(boost::asio::socket_base::send_buffer_size(1024 * 1024));
-    } catch (...) {
-      BOOST_LOG(error) << "Failed to set video socket send buffer size (SO_SENDBUF)";
-    }
-
-    ctx.video_sock.bind(udp::endpoint(protocol, video_port), ec);
-    if (ec) {
-      BOOST_LOG(fatal) << "Couldn't bind Video server to port ["sv << video_port << "]: "sv << ec.message();
-
-      return -1;
-    }
-
     ctx.audio_sock.open(protocol, ec);
     if (ec) {
       BOOST_LOG(fatal) << "Couldn't open socket for Audio server: "sv << ec.message();
@@ -2030,11 +2066,22 @@ namespace stream {
 
     ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(30);
 
+    // Reset the packet queues which were stopped in end_broadcast.
+    for (int i = 0; i < num_video_streams; i++) {
+      auto vp = mail::man->queue<video::packet_t>(mail::video_packets_name(i));
+      vp->reset();
+    }
+    auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
+    audio_packets->reset();
+
     // Restart the io_context in case it was stopped from a previous session.
-    // After calling stop(), restart() must be called before run() will work again.
     ctx.io_context.restart();
 
-    ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx.video_sock)};
+    // Start broadcast threads -- one per video socket, plus audio and control
+    ctx.video_threads.clear();
+    for (int i = 0; i < (int) ctx.video_socks.size(); i++) {
+      ctx.video_threads.emplace_back(videoBroadcastThread, std::ref(*ctx.video_socks[i]), i, std::ref(ctx));
+    }
     ctx.audio_thread = std::thread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::thread {controlBroadcastThread, &ctx.control_server};
 
@@ -2048,26 +2095,34 @@ namespace stream {
 
     broadcast_shutdown_event->raise(true);
 
-    auto video_packets = mail::man->queue<video::packet_t>(mail::video_packets);
-    auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
-
     // Minimize delay stopping video/audio threads
-    video_packets->stop();
+    std::vector<decltype(mail::man->queue<video::packet_t>(mail::video_packets))> video_packet_queues;
+    for (int i = 0; i < (int) ctx.video_socks.size(); i++) {
+      auto vp = mail::man->queue<video::packet_t>(mail::video_packets_name(i));
+      vp->stop();
+      video_packet_queues.push_back(std::move(vp));
+    }
+    auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
     audio_packets->stop();
 
     ctx.message_queue_queue->stop();
     ctx.io_context.stop();
 
-    ctx.video_sock.close();
+    for (auto &sock : ctx.video_socks) {
+      if (sock) sock->close();
+    }
     ctx.audio_sock.close();
 
-    video_packets.reset();
+    video_packet_queues.clear();
     audio_packets.reset();
 
     BOOST_LOG(debug) << "Waiting for main listening thread to end..."sv;
     ctx.recv_thread.join();
-    BOOST_LOG(debug) << "Waiting for main video thread to end..."sv;
-    ctx.video_thread.join();
+    BOOST_LOG(debug) << "Waiting for main video thread(s) to end..."sv;
+    for (auto &t : ctx.video_threads) {
+      if (t.joinable()) t.join();
+    }
+    ctx.video_threads.clear();
     BOOST_LOG(debug) << "Waiting for main audio thread to end..."sv;
     ctx.audio_thread.join();
     BOOST_LOG(debug) << "Waiting for main control thread to end..."sv;
@@ -2145,10 +2200,43 @@ namespace stream {
 
     // Enable local prioritization and QoS tagging on video traffic if requested by the client
     auto address = session->video.peer.address();
-    session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
+    for (int i = 0; i < (int) ref->video_socks.size(); i++) {
+      auto qos = platf::enable_socket_qos(ref->video_socks[i]->native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
+      if (i == 0) session->video.qos = std::move(qos);
+    }
 
-    BOOST_LOG(debug) << "Start capturing Video"sv;
-    video::capture(session->mail, session->config.monitor, session);
+    const int num_streams = session->config.numVideoStreams;
+
+    if (num_streams <= 1) {
+      // Single stream: existing behavior
+      BOOST_LOG(debug) << "Start capturing Video (single stream)"sv;
+      video::capture(session->mail, session->config.monitor, session);
+    } else {
+      // Multi-stream: spawn N capture threads, one per region
+      BOOST_LOG(info) << "Start capturing Video (" << num_streams << " streams)"sv;
+
+      std::vector<std::thread> capture_threads;
+
+      for (int i = 1; i < num_streams; i++) {
+        video::config_t per_stream_config = session->config.monitor;
+        per_stream_config.stream_index = i;
+
+        capture_threads.emplace_back([mail = session->mail, cfg = std::move(per_stream_config), session]() {
+          BOOST_LOG(info) << "Capture thread for stream " << cfg.stream_index << " started";
+          video::capture(mail, cfg, session);
+        });
+      }
+
+      // Stream 0 runs on this thread
+      auto stream0_config = session->config.monitor;
+      stream0_config.stream_index = 0;
+      video::capture(session->mail, stream0_config, session);
+
+      // Wait for additional capture threads to finish
+      for (auto &t : capture_threads) {
+        if (t.joinable()) t.join();
+      }
+    }
   }
 
   void audioThread(session_t *session) {

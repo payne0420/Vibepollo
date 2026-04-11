@@ -906,6 +906,7 @@ namespace rtsp_stream {
     // Report supported and required encryption flags
     ss << "a=x-ss-general.encryptionSupported:" << encryption_flags_supported << std::endl;
     ss << "a=x-ss-general.encryptionRequested:" << encryption_flags_requested << std::endl;
+    ss << "a=x-ss-general.multiStreamSupported:1" << std::endl;
 
     if (video::last_encoder_probe_supported_ref_frames_invalidation) {
       ss << "a=x-nv-video[0].refPicInvalidation:1"sv << std::endl;
@@ -977,7 +978,22 @@ namespace rtsp_stream {
     if (type == "audio"sv) {
       port = net::map_port(stream::AUDIO_STREAM_PORT);
     } else if (type == "video"sv) {
-      port = net::map_port(stream::VIDEO_STREAM_PORT);
+      // Parse optional stream index from target: "video/N/0" -> stream index N
+      int video_stream_index = 0;
+      if (end != std::end(target)) {
+        auto idx_begin = end + 1;
+        auto idx_end = std::find(idx_begin, std::end(target), '/');
+        std::string idx_str {idx_begin, idx_end};
+        try {
+          video_stream_index = std::stoi(idx_str);
+        } catch (...) {
+          video_stream_index = 0;
+        }
+        if (video_stream_index < 0 || video_stream_index >= stream::MAX_VIDEO_STREAMS) {
+          video_stream_index = 0;
+        }
+      }
+      port = net::map_port(stream::video_stream_port(video_stream_index));
     } else if (type == "control"sv) {
       port = net::map_port(stream::CONTROL_PORT);
     } else {
@@ -1140,6 +1156,21 @@ namespace rtsp_stream {
       }
 
       config.monitor.input_only = session.input_only;
+
+      // Multi-stream: populate per-stream display names from VD creation results
+      config.numVideoStreams = session.num_video_streams;
+      config.videoStreamDisplayNames.clear();
+      for (const auto &vd : session.multi_virtual_displays) {
+        config.videoStreamDisplayNames.push_back(vd.display_name);
+      }
+
+      // Fallback for resume: if display names are empty, populate from multi-monitor state
+      if (config.videoStreamDisplayNames.empty() && config.numVideoStreams > 1) {
+        auto mm_state = config::get_multi_monitor_state();
+        for (const auto &dev_id : mm_state.display_device_ids) {
+          config.videoStreamDisplayNames.push_back(dev_id);
+        }
+      }
 
       // Validate that clientRefreshRateX100 is consistent with maxFPS.
       // Some clients send a stale or incorrect clientRefreshRateX100 (e.g. 6000 = 60fps)

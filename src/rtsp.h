@@ -39,6 +39,7 @@ namespace rtsp_stream {
    */
   struct virtual_display_info_t {
     std::string device_id;
+    std::string display_name;
     std::array<std::uint8_t, 16> guid_bytes {};
     std::optional<std::chrono::steady_clock::time_point> ready_since;
   };
@@ -122,6 +123,8 @@ namespace rtsp_stream {
     std::list<crypto::command_entry_t> client_do_cmds;
     std::list<crypto::command_entry_t> client_undo_cmds;
 
+    // Multi-stream: number of independent video streams (defaults to 1 for single-stream)
+    int num_video_streams = 1;
   };
 
   void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);

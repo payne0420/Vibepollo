@@ -1347,10 +1347,21 @@ namespace nvhttp {
           // Enable virtual display for multi-monitor sessions
           launch_session->virtual_display = true;
           launch_session->client_requests_virtual_display = true;
+          // Set num_video_streams for multi-stream region splitting
+          launch_session->num_video_streams = launch_session->multi_monitor_count;
           BOOST_LOG(info) << "Multi-monitor session: " << launch_session->multi_monitor_count
                           << " monitors at " << launch_session->per_monitor_width << "x"
                           << launch_session->per_monitor_height << " each (combined: "
-                          << launch_session->width << "x" << launch_session->height << ").";
+                          << launch_session->width << "x" << launch_session->height
+                          << "), " << launch_session->num_video_streams << " video streams.";
+        }
+      }
+
+      // Also allow explicit numVideoStreams parameter (overrides multi_monitor_count if set)
+      {
+        auto explicit_streams = util::from_view(get_arg(args, "numVideoStreams", "0"));
+        if (explicit_streams > 1) {
+          launch_session->num_video_streams = static_cast<int>(std::clamp(explicit_streams, int64_t{1}, int64_t{4}));
         }
       }
 
