@@ -591,6 +591,14 @@ namespace nvhttp {
               launch_session->multi_virtual_displays.push_back(std::move(vdi));
 
               if (launch_session->multi_monitor_count > 1) {
+                // Set multi-monitor runtime state so capture_multi_region knows the layout
+                config::multi_monitor_state_t mm_state;
+                mm_state.monitor_count = launch_session->multi_monitor_count;
+                mm_state.per_monitor_width = launch_session->per_monitor_width;
+                mm_state.per_monitor_height = launch_session->per_monitor_height;
+                mm_state.display_device_ids.push_back(launch_session->multi_virtual_displays.back().device_id);
+                config::set_multi_monitor_state(mm_state);
+
                 BOOST_LOG(info) << "Multi-monitor: created single virtual display at combined "
                                 << vd_width << "x" << vd_height
                                 << " (" << launch_session->multi_monitor_count << " monitors x "
