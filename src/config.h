@@ -395,4 +395,16 @@ namespace config {
   void set_runtime_output_name_override(std::optional<std::string> output_name);
   std::optional<std::string> runtime_output_name_override();
   std::string get_active_output_name();
+
+  // Multi-stream monitor runtime state
+  struct multi_monitor_state_t {
+    int monitor_count = 1;
+    int per_monitor_width = 0;
+    int per_monitor_height = 0;
+    std::vector<std::string> display_device_ids;
+  };
+  void set_multi_monitor_state(const multi_monitor_state_t &state);
+  void clear_multi_monitor_state();
+  multi_monitor_state_t get_multi_monitor_state();
+  bool is_multi_monitor_active();
 }  // namespace config

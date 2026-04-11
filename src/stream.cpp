@@ -388,13 +388,13 @@ namespace stream {
     message_queue_queue_t message_queue_queue;
 
     std::thread recv_thread;
-    std::thread video_thread;
+    std::vector<std::thread> video_threads;  // One per video stream
     std::thread audio_thread;
     std::thread control_thread;
 
     asio::io_context io_context;
 
-    udp::socket video_sock {io_context};
+    std::vector<std::unique_ptr<udp::socket>> video_socks;  // One per video stream
     udp::socket audio_sock {io_context};
 
     control_server_t control_server;
@@ -1441,7 +1441,8 @@ namespace stream {
     std::map<av_session_id_t, message_queue_t> peer_to_video_session;
     std::map<av_session_id_t, message_queue_t> peer_to_audio_session;
 
-    auto &video_sock = ctx.video_sock;
+    // Use the primary video socket for ping reception
+    auto &video_sock = *ctx.video_socks[0];
     auto &audio_sock = ctx.audio_sock;
 
     auto &message_queue_queue = ctx.message_queue_queue;
@@ -1983,7 +1984,6 @@ namespace stream {
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
     auto protocol = address_family == net::IPV4 ? udp::v4() : udp::v6();
     auto control_port = net::map_port(CONTROL_PORT);
-    auto video_port = net::map_port(VIDEO_STREAM_PORT);
     auto audio_port = net::map_port(AUDIO_STREAM_PORT);
 
     if (ctx.control_server.bind(address_family, control_port)) {
@@ -1992,28 +1992,48 @@ namespace stream {
       return -1;
     }
 
+    // Determine number of video streams to bind sockets for.
+    // For now, check if any pending session requests multi-stream; default to 1.
+    int num_video_streams = 1;
+    auto mm_state = config::get_multi_monitor_state();
+    if (mm_state.monitor_count > 1) {
+      num_video_streams = mm_state.monitor_count;
+    }
+    if (num_video_streams > MAX_VIDEO_STREAMS) {
+      num_video_streams = MAX_VIDEO_STREAMS;
+    }
+
+    // Bind N video sockets
+    ctx.video_socks.clear();
+    for (int i = 0; i < num_video_streams; i++) {
+      auto video_port = net::map_port(video_stream_port(i));
+
+      auto sock = std::make_unique<udp::socket>(ctx.io_context);
+      boost::system::error_code ec;
+      sock->open(protocol, ec);
+      if (ec) {
+        BOOST_LOG(fatal) << "Couldn't open socket for Video server [" << i << "]: "sv << ec.message();
+        return -1;
+      }
+
+      // Set video socket send buffer size (SO_SENDBUF) to 1MB
+      try {
+        sock->set_option(boost::asio::socket_base::send_buffer_size(1024 * 1024));
+      } catch (...) {
+        BOOST_LOG(error) << "Failed to set video socket send buffer size (SO_SENDBUF) for stream " << i;
+      }
+
+      sock->bind(udp::endpoint(protocol, video_port), ec);
+      if (ec) {
+        BOOST_LOG(fatal) << "Couldn't bind Video server [" << i << "] to port ["sv << video_port << "]: "sv << ec.message();
+        return -1;
+      }
+
+      ctx.video_socks.push_back(std::move(sock));
+      BOOST_LOG(info) << "Video stream " << i << " bound to port " << video_port;
+    }
+
     boost::system::error_code ec;
-    ctx.video_sock.open(protocol, ec);
-    if (ec) {
-      BOOST_LOG(fatal) << "Couldn't open socket for Video server: "sv << ec.message();
-
-      return -1;
-    }
-
-    // Set video socket send buffer size (SO_SENDBUF) to 1MB
-    try {
-      ctx.video_sock.set_option(boost::asio::socket_base::send_buffer_size(1024 * 1024));
-    } catch (...) {
-      BOOST_LOG(error) << "Failed to set video socket send buffer size (SO_SENDBUF)";
-    }
-
-    ctx.video_sock.bind(udp::endpoint(protocol, video_port), ec);
-    if (ec) {
-      BOOST_LOG(fatal) << "Couldn't bind Video server to port ["sv << video_port << "]: "sv << ec.message();
-
-      return -1;
-    }
-
     ctx.audio_sock.open(protocol, ec);
     if (ec) {
       BOOST_LOG(fatal) << "Couldn't open socket for Audio server: "sv << ec.message();
@@ -2034,7 +2054,11 @@ namespace stream {
     // After calling stop(), restart() must be called before run() will work again.
     ctx.io_context.restart();
 
-    ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx.video_sock)};
+    // Start broadcast threads -- one per video socket, plus audio and control
+    ctx.video_threads.clear();
+    for (int i = 0; i < (int) ctx.video_socks.size(); i++) {
+      ctx.video_threads.emplace_back(videoBroadcastThread, std::ref(*ctx.video_socks[i]));
+    }
     ctx.audio_thread = std::thread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::thread {controlBroadcastThread, &ctx.control_server};
 
@@ -2058,7 +2082,9 @@ namespace stream {
     ctx.message_queue_queue->stop();
     ctx.io_context.stop();
 
-    ctx.video_sock.close();
+    for (auto &sock : ctx.video_socks) {
+      if (sock) sock->close();
+    }
     ctx.audio_sock.close();
 
     video_packets.reset();
@@ -2066,8 +2092,11 @@ namespace stream {
 
     BOOST_LOG(debug) << "Waiting for main listening thread to end..."sv;
     ctx.recv_thread.join();
-    BOOST_LOG(debug) << "Waiting for main video thread to end..."sv;
-    ctx.video_thread.join();
+    BOOST_LOG(debug) << "Waiting for main video thread(s) to end..."sv;
+    for (auto &t : ctx.video_threads) {
+      if (t.joinable()) t.join();
+    }
+    ctx.video_threads.clear();
     BOOST_LOG(debug) << "Waiting for main audio thread to end..."sv;
     ctx.audio_thread.join();
     BOOST_LOG(debug) << "Waiting for main control thread to end..."sv;
@@ -2145,7 +2174,7 @@ namespace stream {
 
     // Enable local prioritization and QoS tagging on video traffic if requested by the client
     auto address = session->video.peer.address();
-    session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
+    session->video.qos = platf::enable_socket_qos(ref->video_socks[0]->native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
     BOOST_LOG(debug) << "Start capturing Video"sv;
     video::capture(session->mail, session->config.monitor, session);

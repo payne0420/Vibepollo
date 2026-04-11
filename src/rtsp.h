@@ -107,6 +107,17 @@ namespace rtsp_stream {
     std::list<crypto::command_entry_t> client_do_cmds;
     std::list<crypto::command_entry_t> client_undo_cmds;
 
+    // Multi-stream monitor support: N independent video streams
+    int num_video_streams = 1;
+
+    struct per_display_info_t {
+      std::array<std::uint8_t, 16> guid_bytes {};
+      std::string device_id;
+      std::string display_name;
+      std::optional<std::chrono::steady_clock::time_point> ready_since;
+    };
+
+    std::vector<per_display_info_t> video_displays;  // One per video stream
   };
 
   void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);

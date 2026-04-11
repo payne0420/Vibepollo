@@ -1289,6 +1289,18 @@ namespace nvhttp {
       launch_session->virtual_display = util::from_view(get_arg(args, "virtualDisplay", "0")) || named_cert_p->always_use_virtual_display;
       launch_session->scale_factor = util::from_view(get_arg(args, "scaleFactor", "100"));
 
+      // Multi-stream monitor support: parse number of independent video streams
+      launch_session->num_video_streams = static_cast<int>(std::clamp(
+        util::from_view(get_arg(args, "numVideoStreams", "1")), int64_t {1}, int64_t {4}));
+      if (launch_session->num_video_streams > 1) {
+        // Enable virtual display for multi-stream sessions
+        launch_session->virtual_display = true;
+        launch_session->client_requests_virtual_display = true;
+        BOOST_LOG(info) << "Multi-stream session: " << launch_session->num_video_streams
+                        << " video streams at " << launch_session->width << "x"
+                        << launch_session->height << " each.";
+      }
+
       launch_session->client_do_cmds = named_cert_p->do_cmds;
       launch_session->client_undo_cmds = named_cert_p->undo_cmds;
 

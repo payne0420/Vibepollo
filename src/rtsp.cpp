@@ -977,7 +977,22 @@ namespace rtsp_stream {
     if (type == "audio"sv) {
       port = net::map_port(stream::AUDIO_STREAM_PORT);
     } else if (type == "video"sv) {
-      port = net::map_port(stream::VIDEO_STREAM_PORT);
+      // Parse optional stream index from target: "video/N/0" -> stream index N
+      int video_stream_index = 0;
+      if (end != std::end(target)) {
+        auto idx_begin = end + 1;
+        auto idx_end = std::find(idx_begin, std::end(target), '/');
+        std::string idx_str {idx_begin, idx_end};
+        try {
+          video_stream_index = std::stoi(idx_str);
+        } catch (...) {
+          video_stream_index = 0;
+        }
+        if (video_stream_index < 0 || video_stream_index >= stream::MAX_VIDEO_STREAMS) {
+          video_stream_index = 0;
+        }
+      }
+      port = net::map_port(stream::video_stream_port(video_stream_index));
     } else if (type == "control"sv) {
       port = net::map_port(stream::CONTROL_PORT);
     } else {
