@@ -1524,6 +1524,12 @@ namespace video {
     }
 
     if (!disp) {
+      BOOST_LOG(error) << "Failed to create display for video capture. "
+                       << "Display count: " << display_names.size()
+                       << ", display index: " << display_p
+                       << (display_p >= 0 && display_p < (int)display_names.size()
+                           ? ", name: " + display_names[display_p]
+                           : "");
       return;
     }
 
