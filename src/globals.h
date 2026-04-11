@@ -49,6 +49,15 @@ namespace mail {
   MAIL(audio_packets);
   MAIL(switch_display);
 
+  /**
+   * @brief Returns the queue name for video packets of a given stream index.
+   * Stream 0 returns "video_packets" (backward compatible), stream N returns "video_packets_N".
+   */
+  inline std::string video_packets_name(int stream_index) {
+    if (stream_index == 0) return std::string(video_packets);
+    return std::string(video_packets) + "_" + std::to_string(stream_index);
+  }
+
   // Local mail
   MAIL(touch_port);
   MAIL(idr);

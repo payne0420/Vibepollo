@@ -1441,8 +1441,6 @@ namespace stream {
     std::map<av_session_id_t, message_queue_t> peer_to_video_session;
     std::map<av_session_id_t, message_queue_t> peer_to_audio_session;
 
-    // Use the primary video socket for ping reception
-    auto &video_sock = *ctx.video_socks[0];
     auto &audio_sock = ctx.audio_sock;
 
     auto &message_queue_queue = ctx.message_queue_queue;
@@ -1452,8 +1450,13 @@ namespace stream {
 
     udp::endpoint peer;
 
-    std::array<char, 2048> buf[2];
-    std::function<void(const boost::system::error_code, size_t)> recv_func[2];
+    // N video sockets + 1 audio socket
+    const int num_video = (int) ctx.video_socks.size();
+    const int total_sockets = num_video + 1;
+    const int audio_idx = num_video;  // audio is the last element
+
+    std::vector<std::array<char, 2048>> buf(total_sockets);
+    std::vector<std::function<void(const boost::system::error_code, size_t)>> recv_func(total_sockets);
 
     auto populate_peer_to_session = [&]() {
       while (message_queue_queue->peek()) {
@@ -1479,13 +1482,12 @@ namespace stream {
       }
     };
 
-    auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session) {
-      recv_func[buf_elem] = [&, buf_elem](const boost::system::error_code &ec, size_t bytes) {
+    auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session, std::string_view type_str) {
+      recv_func[buf_elem] = [&, buf_elem, type_str](const boost::system::error_code &ec, size_t bytes) {
         auto fg = util::fail_guard([&]() {
           sock.async_receive_from(asio::buffer(buf[buf_elem]), peer, 0, recv_func[buf_elem]);
         });
 
-        auto type_str = buf_elem ? "AUDIO"sv : "VIDEO"sv;
         BOOST_LOG(verbose) << "Recv: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
 
         populate_peer_to_session();
@@ -1518,20 +1520,26 @@ namespace stream {
       };
     };
 
-    recv_func_init(video_sock, 0, peer_to_video_session);
-    recv_func_init(audio_sock, 1, peer_to_audio_session);
+    // Initialize receive handlers for all video sockets
+    for (int i = 0; i < num_video; i++) {
+      recv_func_init(*ctx.video_socks[i], i, peer_to_video_session, "VIDEO"sv);
+    }
+    recv_func_init(audio_sock, audio_idx, peer_to_audio_session, "AUDIO"sv);
 
-    video_sock.async_receive_from(asio::buffer(buf[0]), peer, 0, recv_func[0]);
-    audio_sock.async_receive_from(asio::buffer(buf[1]), peer, 0, recv_func[1]);
+    // Start async receives on all sockets
+    for (int i = 0; i < num_video; i++) {
+      ctx.video_socks[i]->async_receive_from(asio::buffer(buf[i]), peer, 0, recv_func[i]);
+    }
+    audio_sock.async_receive_from(asio::buffer(buf[audio_idx]), peer, 0, recv_func[audio_idx]);
 
     while (!broadcast_shutdown_event->peek()) {
       io.run();
     }
   }
 
-  void videoBroadcastThread(udp::socket &sock) {
+  void videoBroadcastThread(udp::socket &sock, int stream_index) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
-    auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    auto packets = mail::man->queue<video::packet_t>(mail::video_packets_name(stream_index));
     auto video_epoch = std::chrono::steady_clock::now();
 
     // Video traffic is sent on this thread
@@ -1974,13 +1982,6 @@ namespace stream {
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     broadcast_shutdown_event->reset();
 
-    // Reset the packet queues which were stopped in end_broadcast.
-    // If not reset, the broadcast threads will exit immediately when pop() returns null.
-    auto video_packets = mail::man->queue<video::packet_t>(mail::video_packets);
-    auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
-    video_packets->reset();
-    audio_packets->reset();
-
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
     auto protocol = address_family == net::IPV4 ? udp::v4() : udp::v6();
     auto control_port = net::map_port(CONTROL_PORT);
@@ -2050,6 +2051,15 @@ namespace stream {
 
     ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(30);
 
+    // Reset the packet queues which were stopped in end_broadcast.
+    // If not reset, the broadcast threads will exit immediately when pop() returns null.
+    for (int i = 0; i < num_video_streams; i++) {
+      auto vp = mail::man->queue<video::packet_t>(mail::video_packets_name(i));
+      vp->reset();
+    }
+    auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
+    audio_packets->reset();
+
     // Restart the io_context in case it was stopped from a previous session.
     // After calling stop(), restart() must be called before run() will work again.
     ctx.io_context.restart();
@@ -2057,7 +2067,7 @@ namespace stream {
     // Start broadcast threads -- one per video socket, plus audio and control
     ctx.video_threads.clear();
     for (int i = 0; i < (int) ctx.video_socks.size(); i++) {
-      ctx.video_threads.emplace_back(videoBroadcastThread, std::ref(*ctx.video_socks[i]));
+      ctx.video_threads.emplace_back(videoBroadcastThread, std::ref(*ctx.video_socks[i]), i);
     }
     ctx.audio_thread = std::thread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::thread {controlBroadcastThread, &ctx.control_server};
@@ -2072,11 +2082,14 @@ namespace stream {
 
     broadcast_shutdown_event->raise(true);
 
-    auto video_packets = mail::man->queue<video::packet_t>(mail::video_packets);
-    auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
-
     // Minimize delay stopping video/audio threads
-    video_packets->stop();
+    std::vector<decltype(mail::man->queue<video::packet_t>(mail::video_packets))> video_packet_queues;
+    for (int i = 0; i < (int) ctx.video_socks.size(); i++) {
+      auto vp = mail::man->queue<video::packet_t>(mail::video_packets_name(i));
+      vp->stop();
+      video_packet_queues.push_back(std::move(vp));
+    }
+    auto audio_packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
     audio_packets->stop();
 
     ctx.message_queue_queue->stop();
@@ -2087,7 +2100,7 @@ namespace stream {
     }
     ctx.audio_sock.close();
 
-    video_packets.reset();
+    video_packet_queues.clear();
     audio_packets.reset();
 
     BOOST_LOG(debug) << "Waiting for main listening thread to end..."sv;
@@ -2174,7 +2187,10 @@ namespace stream {
 
     // Enable local prioritization and QoS tagging on video traffic if requested by the client
     auto address = session->video.peer.address();
-    session->video.qos = platf::enable_socket_qos(ref->video_socks[0]->native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
+    for (int i = 0; i < (int) ref->video_socks.size(); i++) {
+      auto qos = platf::enable_socket_qos(ref->video_socks[i]->native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
+      if (i == 0) session->video.qos = std::move(qos);
+    }
 
     const int num_streams = session->config.numVideoStreams;
 
