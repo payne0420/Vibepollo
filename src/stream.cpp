@@ -1598,6 +1598,15 @@ namespace stream {
       auto lowseq = session->video.lowseq[stream_index];
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
+
+      // DIAG: log first 10 frames per stream to verify data flow
+      if (packet->frame_index() <= 10) {
+        BOOST_LOG(info) << "DIAG stream=" << stream_index
+                        << " frame=" << packet->frame_index()
+                        << " idr=" << packet->is_idr()
+                        << " size=" << payload.size()
+                        << " lowseq=" << lowseq;
+      }
       std::vector<uint8_t> payload_with_replacements;
 
       // Apply replacements on the packet payload before performing any other operations.
@@ -1755,6 +1764,11 @@ namespace stream {
           }
           if (stream_peer.port() == 0) {
             stream_peer = session->video.peer;
+            if (packet->frame_index() <= 3) {
+              BOOST_LOG(info) << "DIAG stream=" << stream_index << " using FALLBACK peer " << stream_peer;
+            }
+          } else if (packet->frame_index() <= 3) {
+            BOOST_LOG(info) << "DIAG stream=" << stream_index << " peer=" << stream_peer;
           }
 
           auto peer_address = stream_peer.address();

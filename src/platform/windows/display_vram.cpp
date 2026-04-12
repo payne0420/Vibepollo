@@ -361,6 +361,18 @@ namespace platf::dxgi {
   class d3d_base_encode_device final {
   public:
     int convert(platf::img_t &img_base) {
+      // DIAG: verify crop constant buffer is bound on first convert
+      if (diag_convert_count < 3) {
+        ID3D11Buffer *bound_cb = nullptr;
+        device_ctx->VSGetConstantBuffers(4, 1, &bound_cb);
+        BOOST_LOG(info) << "DIAG convert #" << diag_convert_count
+                        << " crop_region_buf=" << (void*)crop_region.get()
+                        << " bound_b4=" << (void*)bound_cb
+                        << " match=" << (bound_cb == crop_region.get());
+        if (bound_cb) bound_cb->Release();
+        diag_convert_count++;
+      }
+
       // Garbage collect mapped capture images whose weak references have expired
       for (auto it = img_ctx_map.begin(); it != img_ctx_map.end();) {
         if (it->second.img_weak.expired()) {
@@ -987,6 +999,7 @@ namespace platf::dxgi {
     }
 
     ::video::color_t *color_p;
+    int diag_convert_count = 0;  // DIAG: for one-shot logging
 
     // Keep the underlying D3D device/context alive until after all dependent resources have been released.
     device_t device;
