@@ -425,14 +425,14 @@ namespace stream {
     struct {
       std::string ping_payload;
 
-      int lowseq;
+      int lowseq[MAX_VIDEO_STREAMS] {};
       udp::endpoint peer;
 
       // Per-stream peer endpoints for multi-stream video.
       udp::endpoint stream_peers[MAX_VIDEO_STREAMS];
 
       std::optional<crypto::cipher::gcm_t> cipher;
-      std::uint64_t gcm_iv_counter;
+      std::uint64_t gcm_iv_counter[MAX_VIDEO_STREAMS] {};
 
       safe::mail_raw_t::event_t<bool> idr_events;
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
@@ -1595,7 +1595,7 @@ namespace stream {
       if (!session) {
         continue;
       }
-      auto lowseq = session->video.lowseq;
+      auto lowseq = session->video.lowseq[stream_index];
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
       std::vector<uint8_t> payload_with_replacements;
@@ -1810,9 +1810,9 @@ namespace stream {
               //
               // The IV counter is 64 bits long which allows for 2^64 encrypted video packets
               // to be sent to each client before the IV repeats.
-              std::copy_n((uint8_t *) &session->video.gcm_iv_counter, sizeof(session->video.gcm_iv_counter), std::begin(iv));
+              std::copy_n((uint8_t *) &session->video.gcm_iv_counter[stream_index], sizeof(session->video.gcm_iv_counter[stream_index]), std::begin(iv));
               iv[11] = 'V';  // Video stream
-              session->video.gcm_iv_counter++;
+              session->video.gcm_iv_counter[stream_index]++;
 
               // Encrypt the target buffer in place
               auto *prefix = (video_packet_enc_prefix_t *) shards.prefix(x);
@@ -1892,7 +1892,7 @@ namespace stream {
           lowseq += shards.size();
         });
 
-        session->video.lowseq = lowseq;
+        session->video.lowseq[stream_index] = lowseq;
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);
@@ -2625,7 +2625,7 @@ namespace stream {
 
       session->video.idr_events = mail->event<bool>(mail::idr_name(0));
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames_name(0));
-      session->video.lowseq = 0;
+      std::fill(std::begin(session->video.lowseq), std::end(session->video.lowseq), 0);
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
         BOOST_LOG(info) << "Video encryption enabled"sv;
@@ -2633,7 +2633,7 @@ namespace stream {
           launch_session.gcm_key,
           false
         };
-        session->video.gcm_iv_counter = 0;
+        std::fill(std::begin(session->video.gcm_iv_counter), std::end(session->video.gcm_iv_counter), 0);
       }
 
       constexpr auto max_block_size = crypto::cipher::round_to_pkcs7_padded(2048);
