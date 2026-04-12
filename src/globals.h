@@ -66,4 +66,22 @@ namespace mail {
   MAIL(hdr);
 #undef MAIL
 
+  /**
+   * @brief Returns the event name for IDR requests of a given stream index.
+   * Stream 0 returns "idr" (backward compatible), stream N returns "idr_N".
+   */
+  inline std::string idr_name(int stream_index) {
+    if (stream_index == 0) return std::string(idr);
+    return std::string(idr) + "_" + std::to_string(stream_index);
+  }
+
+  /**
+   * @brief Returns the event name for reference frame invalidation of a given stream index.
+   * Stream 0 returns "invalidate_ref_frames" (backward compatible), stream N returns "invalidate_ref_frames_N".
+   */
+  inline std::string invalidate_ref_frames_name(int stream_index) {
+    if (stream_index == 0) return std::string(invalidate_ref_frames);
+    return std::string(invalidate_ref_frames) + "_" + std::to_string(stream_index);
+  }
+
 }  // namespace mail

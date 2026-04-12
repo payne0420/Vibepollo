@@ -1505,16 +1505,29 @@ namespace video {
       }
 
       // Check for multi-monitor composite capture
+      // Only use composite display when we have multiple actual display device IDs.
+      // When using a single combined virtual display for multi-monitor, we use
+      // regular capture at the combined resolution and let multi-region capture split it.
       auto mm_state = config::get_multi_monitor_state();
-      if (mm_state.monitor_count > 1 && !mm_state.display_device_ids.empty()) {
+
+      // For multi-region capture, use display dimensions (combined) instead of encoder dimensions (per-monitor)
+      config_t display_config = capture_ctxs.front().config;
+      if (display_config.display_width > 0 && display_config.display_height > 0) {
+        BOOST_LOG(info) << "Using display dimensions " << display_config.display_width << "x" << display_config.display_height
+                        << " (encoder: " << display_config.width << "x" << display_config.height << ")";
+        display_config.width = display_config.display_width;
+        display_config.height = display_config.display_height;
+      }
+
+      if (mm_state.monitor_count > 1 && mm_state.display_device_ids.size() > 1) {
         disp = platf::display_composite(
           encoder.platform_formats->dev_type,
           mm_state.display_device_ids,
           mm_state.per_monitor_width,
           mm_state.per_monitor_height,
-          capture_ctxs.front().config);
+          display_config);
       } else {
-        disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+        disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], display_config);
       }
       if (disp) {
         break;
@@ -1649,38 +1662,12 @@ namespace video {
           if (frame_captured) {
             // Multi-stream region crop: if the encoder expects a smaller frame than
             // what was captured (combined display), crop to the region for this stream.
-            if (img && img->data &&
-                capture_ctx->config.width > 0 &&
-                capture_ctx->config.width < (int) img->width) {
-              int region_idx = capture_ctx->config.stream_index;
-              int crop_w = capture_ctx->config.width;
-              int crop_h = capture_ctx->config.height;
-              int src_x = region_idx * crop_w;
-              int bpp = 4;  // BGRA
-
-              auto cropped = disp->alloc_img();
-              if (cropped) {
-                cropped->width = crop_w;
-                cropped->height = crop_h;
-                cropped->row_pitch = crop_w * bpp;
-                cropped->frame_timestamp = img->frame_timestamp;
-
-                // Allocate buffer if not already allocated by alloc_img
-                if (!cropped->data) {
-                  cropped->data = new std::uint8_t[crop_w * crop_h * bpp];
-                }
-
-                for (int row = 0; row < crop_h && row < (int) img->height; row++) {
-                  auto *dst = cropped->data + row * cropped->row_pitch;
-                  auto *src = img->data + row * img->row_pitch + src_x * bpp;
-                  std::memcpy(dst, src, crop_w * bpp);
-                }
-
-                capture_ctx->images->raise(std::move(cropped));
-              }
-            } else {
-              capture_ctx->images->raise(img);
-            }
+            // NOTE: CPU cropping is DISABLED - VRAM capture (WGC IPC) sets img->data
+            // to a D3D texture pointer that cannot be accessed via memcpy.
+            // TODO: Implement GPU-side cropping for multi-stream VRAM capture.
+            // For now, all streams receive the full frame; the encoder will use the
+            // top-left portion matching its configured dimensions.
+            capture_ctx->images->raise(img);
           }
 
           ++capture_ctx;
@@ -2383,8 +2370,8 @@ namespace video {
 
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     auto packets = mail::man->queue<packet_t>(mail::video_packets_name(config.stream_index));
-    auto idr_events = mail->event<bool>(mail::idr);
-    auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto idr_events = mail->event<bool>(mail::idr_name(config.stream_index));
+    auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames_name(config.stream_index));
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2968,7 +2955,7 @@ namespace video {
       return;
     }
 
-    auto idr_events = mail->event<bool>(mail::idr);
+    auto idr_events = mail->event<bool>(mail::idr_name(config.stream_index));
 
     idr_events->raise(true);
     if (encoder->flags & PARALLEL_ENCODING) {
@@ -3024,17 +3011,24 @@ namespace video {
       // Set encoder dimensions to per-monitor (NOT combined)
       stream_config.width = per_monitor_width;
       stream_config.height = per_monitor_height;
+      // Display dimensions remain at combined resolution
+      stream_config.display_width = config.width;
+      stream_config.display_height = config.height;
 
       stream_threads.emplace_back([mail, cfg = std::move(stream_config), channel_data]() {
         capture(mail, cfg, channel_data);
       });
     }
 
-    // Stream 0 runs on this thread
+    // Stream 0 runs on this thread - it determines display creation
     config_t stream0_config = config;
     stream0_config.stream_index = 0;
+    // Encoder uses per-monitor dimensions
     stream0_config.width = per_monitor_width;
     stream0_config.height = per_monitor_height;
+    // Display uses combined dimensions (from original config)
+    stream0_config.display_width = config.width;
+    stream0_config.display_height = config.height;
     capture(mail, stream0_config, channel_data);
 
     for (auto &t : stream_threads) {

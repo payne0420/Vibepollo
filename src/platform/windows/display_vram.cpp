@@ -489,6 +489,51 @@ namespace platf::dxgi {
       this->color_matrix = std::move(color_matrix);
     }
 
+    /**
+     * @brief Set crop region for multi-stream capture.
+     *
+     * Configures the vertex shader to sample from a horizontal sub-region of the
+     * source texture, enabling multiple encoders to render different monitor regions
+     * from a single combined capture.
+     *
+     * @param stream_index Which stream (0, 1, 2, ...) - determines horizontal offset
+     * @param region_width Width of this stream's region (typically per-monitor width)
+     * @param total_width Total width of the combined source texture
+     */
+    void set_crop_region(int stream_index, int region_width, int total_width) {
+      if (total_width <= 0 || region_width <= 0 || stream_index < 0) {
+        BOOST_LOG(debug) << "set_crop_region: invalid params, disabling crop";
+        return;
+      }
+
+      // Calculate UV offset and scale for horizontal cropping
+      // stream_index 0 -> offset 0.0, stream_index 1 -> offset region_width/total_width, etc.
+      float uv_offset_x = (float)(stream_index * region_width) / (float)total_width;
+      float uv_scale_x = (float)region_width / (float)total_width;
+
+      // Y axis: no cropping (full height)
+      float uv_offset_y = 0.0f;
+      float uv_scale_y = 1.0f;
+
+      BOOST_LOG(info) << "set_crop_region: stream=" << stream_index
+                      << " region=" << region_width << "x" << display->height
+                      << " total=" << total_width
+                      << " UV offset=" << uv_offset_x << "," << uv_offset_y
+                      << " scale=" << uv_scale_x << "," << uv_scale_y;
+
+      // Create constant buffer: float2 offset, float2 scale (16-byte aligned)
+      float crop_data[4] = {uv_offset_x, uv_offset_y, uv_scale_x, uv_scale_y};
+      crop_region = make_buffer(device.get(), crop_data);
+
+      if (!crop_region) {
+        BOOST_LOG(error) << "Failed to create crop region constant buffer";
+        return;
+      }
+
+      // Bind to slot b4 (matching HLSL cbuffer register)
+      device_ctx->VSSetConstantBuffers(4, 1, &crop_region);
+    }
+
     int init_output(ID3D11Texture2D *frame_texture, int width, int height) {
       // The underlying frame pool owns the texture, so we must reference it for ourselves
       frame_texture->AddRef();
@@ -953,6 +998,7 @@ namespace platf::dxgi {
 
     buf_t subsample_offset;
     buf_t color_matrix;
+    buf_t crop_region;  // Multi-stream crop region constant buffer
 
     blend_t blend_disable;
     sampler_state_t sampler_linear;
@@ -1117,7 +1163,17 @@ namespace platf::dxgi {
       }
 
       base.apply_colorspace(colorspace);
-      return base.init_output(nvenc_d3d->get_input_texture(), client_config.width, client_config.height) == 0;
+      if (base.init_output(nvenc_d3d->get_input_texture(), client_config.width, client_config.height) != 0) {
+        return false;
+      }
+
+      // Set up crop region for multi-stream capture
+      // If display_width > 0, we're capturing a combined display and need to crop to this stream's region
+      if (client_config.display_width > 0 && client_config.display_width > client_config.width) {
+        base.set_crop_region(client_config.stream_index, client_config.width, client_config.display_width);
+      }
+
+      return true;
     }
 
     int convert(platf::img_t &img_base) override {

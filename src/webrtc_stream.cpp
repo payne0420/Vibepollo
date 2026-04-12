@@ -1621,13 +1621,16 @@ namespace webrtc_stream {
         return;
       }
 
-      auto idr_events = mail->event<bool>(mail::idr);
+      // Raise IDR for all possible video streams (unused events are harmless)
+      auto idr_events = mail->event<bool>(mail::idr_name(0));
       if (!idr_events) {
         BOOST_LOG(debug) << "WebRTC: keyframe request skipped (" << reason << ") - no idr event";
         return;
       }
 
-      idr_events->raise(true);
+      for (int i = 0; i < stream::MAX_VIDEO_STREAMS; i++) {
+        mail->event<bool>(mail::idr_name(i))->raise(true);
+      }
       BOOST_LOG(debug) << "WebRTC: keyframe requested (" << reason << ')';
     }
 

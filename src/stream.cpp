@@ -566,7 +566,10 @@ namespace stream {
       if (!session || !session->video.idr_events) {
         continue;
       }
-      session->video.idr_events->raise(true);
+      // Raise IDR for all active video streams in this session
+      for (int i = 0; i < std::max(1, session->config.numVideoStreams); i++) {
+        session->mail->event<bool>(mail::idr_name(i))->raise(true);
+      }
     }
   }
 
@@ -1149,7 +1152,10 @@ namespace stream {
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
-      session->video.idr_events->raise(true);
+      // Fan out IDR request to all active video streams
+      for (int i = 0; i < std::max(1, session->config.numVideoStreams); i++) {
+        session->mail->event<bool>(mail::idr_name(i))->raise(true);
+      }
     });
 
     server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
@@ -1162,7 +1168,11 @@ namespace stream {
         << "firstFrame [" << firstFrame << ']' << std::endl
         << "lastFrame [" << lastFrame << ']';
 
-      session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
+      // Fan out RFI to all active video streams
+      auto pair = std::make_pair(firstFrame, lastFrame);
+      for (int i = 0; i < std::max(1, session->config.numVideoStreams); i++) {
+        session->mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames_name(i))->raise(pair);
+      }
     });
 
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
@@ -2613,8 +2623,8 @@ namespace stream {
         false
       };
 
-      session->video.idr_events = mail->event<bool>(mail::idr);
-      session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+      session->video.idr_events = mail->event<bool>(mail::idr_name(0));
+      session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames_name(0));
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {

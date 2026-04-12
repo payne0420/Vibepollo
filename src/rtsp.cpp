@@ -1172,6 +1172,21 @@ namespace rtsp_stream {
         }
       }
 
+      // Multi-stream: override config dimensions with combined resolution.
+      // The client sends per-monitor resolution, but the capture config needs
+      // the full combined resolution for multi-region capture to split properly.
+      if (config.numVideoStreams > 1) {
+        auto mm_state = config::get_multi_monitor_state();
+        if (mm_state.monitor_count > 1) {
+          int combined_width = mm_state.per_monitor_width * mm_state.monitor_count;
+          BOOST_LOG(info) << "Multi-stream: overriding capture dimensions from "
+                          << config.monitor.width << "x" << config.monitor.height
+                          << " to combined " << combined_width << "x" << mm_state.per_monitor_height;
+          config.monitor.width = combined_width;
+          config.monitor.height = mm_state.per_monitor_height;
+        }
+      }
+
       // Validate that clientRefreshRateX100 is consistent with maxFPS.
       // Some clients send a stale or incorrect clientRefreshRateX100 (e.g. 6000 = 60fps)
       // while requesting a higher maxFPS (e.g. 120). Since framerateX100 unconditionally

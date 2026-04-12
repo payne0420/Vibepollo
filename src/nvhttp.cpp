@@ -1357,6 +1357,12 @@ namespace nvhttp {
           launch_session->client_requests_virtual_display = true;
           // Set num_video_streams for multi-stream region splitting
           launch_session->num_video_streams = launch_session->multi_monitor_count;
+          // Update session dimensions to combined resolution for multi-monitor.
+          // The virtual display is created at this combined resolution, and the
+          // display helper APPLY request must use the same dimensions.
+          launch_session->width = launch_session->per_monitor_width * launch_session->multi_monitor_count;
+          // Height stays the same since monitors are arranged horizontally
+          launch_session->height = launch_session->per_monitor_height;
           BOOST_LOG(info) << "Multi-monitor session: " << launch_session->multi_monitor_count
                           << " monitors at " << launch_session->per_monitor_width << "x"
                           << launch_session->per_monitor_height << " each (combined: "

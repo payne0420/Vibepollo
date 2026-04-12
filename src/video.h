@@ -56,6 +56,11 @@ namespace video {
     // Multi-stream fields (appended per the big warning above)
     std::string display_name_override;  // Target a specific display by name
     int stream_index = 0;  // Which stream this config belongs to
+
+    // For multi-region capture: display dimensions may differ from encoder dimensions.
+    // When display_width > 0, use these for display creation; otherwise use width/height.
+    int display_width = 0;
+    int display_height = 0;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
