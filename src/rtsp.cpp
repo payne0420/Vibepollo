@@ -1157,34 +1157,30 @@ namespace rtsp_stream {
 
       config.monitor.input_only = session.input_only;
 
-      // Multi-stream: populate per-stream display names from VD creation results
+      // Multi-stream: the stream count is established authoritatively by the HTTP
+      // /launch query (multiMonitor / numVideoStreams), carried on launch_session.
+      // The SDP multi-stream attributes the client also sends (x-ss-video.numStreams,
+      // x-ml-general.multiStreamCount, the ML_FF_MULTI_STREAM feature-flag bit) are
+      // advisory only and are intentionally not consulted -- launch_session is the
+      // single source of truth so the two channels cannot disagree.
       config.numVideoStreams = session.num_video_streams;
       config.videoStreamDisplayNames.clear();
       for (const auto &vd : session.multi_virtual_displays) {
         config.videoStreamDisplayNames.push_back(vd.display_name);
       }
 
-      // Fallback for resume: if display names are empty, populate from multi-monitor state
-      if (config.videoStreamDisplayNames.empty() && config.numVideoStreams > 1) {
-        auto mm_state = config::get_multi_monitor_state();
-        for (const auto &dev_id : mm_state.display_device_ids) {
-          config.videoStreamDisplayNames.push_back(dev_id);
-        }
-      }
-
-      // Multi-stream: override config dimensions with combined resolution.
-      // The client sends per-monitor resolution, but the capture config needs
-      // the full combined resolution for multi-region capture to split properly.
-      if (config.numVideoStreams > 1) {
-        auto mm_state = config::get_multi_monitor_state();
-        if (mm_state.monitor_count > 1) {
-          int combined_width = mm_state.per_monitor_width * mm_state.monitor_count;
-          BOOST_LOG(info) << "Multi-stream: overriding capture dimensions from "
-                          << config.monitor.width << "x" << config.monitor.height
-                          << " to combined " << combined_width << "x" << mm_state.per_monitor_height;
-          config.monitor.width = combined_width;
-          config.monitor.height = mm_state.per_monitor_height;
-        }
+      // Multi-stream: override config dimensions with the combined resolution.
+      // The client sends per-monitor resolution, but the capture config needs the
+      // full combined resolution for multi-region capture to split properly. These
+      // values come from the launch session, so they remain correct on resume --
+      // a process global would be stale or cleared by then.
+      if (config.numVideoStreams > 1 && session.multi_monitor_count > 1) {
+        int combined_width = session.per_monitor_width * session.multi_monitor_count;
+        BOOST_LOG(info) << "Multi-stream: overriding capture dimensions from "
+                        << config.monitor.width << "x" << config.monitor.height
+                        << " to combined " << combined_width << "x" << session.per_monitor_height;
+        config.monitor.width = combined_width;
+        config.monitor.height = session.per_monitor_height;
       }
 
       // Validate that clientRefreshRateX100 is consistent with maxFPS.

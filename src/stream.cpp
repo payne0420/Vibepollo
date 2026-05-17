@@ -428,9 +428,6 @@ namespace stream {
       int lowseq[MAX_VIDEO_STREAMS] {};
       udp::endpoint peer;
 
-      // Per-stream peer endpoints for multi-stream video.
-      udp::endpoint stream_peers[MAX_VIDEO_STREAMS];
-
       std::optional<crypto::cipher::gcm_t> cipher;
       std::uint64_t gcm_iv_counter[MAX_VIDEO_STREAMS] {};
 
@@ -1168,11 +1165,24 @@ namespace stream {
         << "firstFrame [" << firstFrame << ']' << std::endl
         << "lastFrame [" << lastFrame << ']';
 
-      // Fan out RFI to all active video streams
-      auto pair = std::make_pair(firstFrame, lastFrame);
-      for (int i = 0; i < std::max(1, session->config.numVideoStreams); i++) {
-        session->mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames_name(i))->raise(pair);
+      const int num_streams = std::max(1, session->config.numVideoStreams);
+      if (num_streams > 1) {
+        // The reference-frame-invalidation request carries one stream's frame
+        // numbers, but the wire message has no stream index. Each encoder has its
+        // own independent frame counter, so applying this range to the wrong
+        // encoder would invalidate the wrong reference frames and corrupt that
+        // stream's P-frames. Since we cannot tell which stream it was meant for,
+        // we do NOT fan RFI out: the affected stream's decoder will recover by
+        // requesting an IDR through its own DR_NEED_IDR path, which carries no
+        // frame-number dependency. (A stream-indexed RFI message would let us
+        // target the correct encoder; that is a protocol addition.)
+        BOOST_LOG(debug) << "Ignoring stream-blind RFI in multi-stream session"sv;
+        return;
       }
+
+      // Single stream: the frame numbers are unambiguous, so apply RFI normally.
+      session->mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames_name(0))
+        ->raise(std::make_pair(firstFrame, lastFrame));
     });
 
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
@@ -1817,14 +1827,17 @@ namespace stream {
             // Encrypt this shard if video encryption is enabled
             if (session->video.cipher) {
               // We use the deterministic IV construction algorithm specified in NIST SP 800-38D
-              // Section 8.2.1. The sequence number is our "invocation" field and the 'V' in the
-              // high bytes is the "fixed" field. Because each client provides their own unique
-              // key, our values in the fixed field need only uniquely identify each independent
-              // use of the client's key with AES-GCM in our code.
+              // Section 8.2.1. The counter is our "invocation" field; the fixed field is the 'V'
+              // marker plus the stream index. Every video stream in a multi-stream session shares
+              // the one key the client provided, so the stream index MUST be part of the fixed
+              // field: each per-stream gcm_iv_counter starts at 0, so without it stream 0 and
+              // stream 1 would emit identical (key, IV) pairs -- a catastrophic AES-GCM nonce
+              // reuse. iv[8..10] are otherwise unused; iv[10] holds the stream index (0..3).
               //
               // The IV counter is 64 bits long which allows for 2^64 encrypted video packets
-              // to be sent to each client before the IV repeats.
+              // to be sent on each stream before the IV repeats.
               std::copy_n((uint8_t *) &session->video.gcm_iv_counter[stream_index], sizeof(session->video.gcm_iv_counter[stream_index]), std::begin(iv));
+              iv[10] = (uint8_t) stream_index;  // Separate the IV space of streams that share a key
               iv[11] = 'V';  // Video stream
               session->video.gcm_iv_counter[stream_index]++;
 
@@ -2238,16 +2251,49 @@ namespace stream {
     } else {
       // Multi-stream region splitting: one capture thread produces the combined frame,
       // then crops it into N per-monitor regions and encodes each separately.
-      auto mm_state = config::get_multi_monitor_state();
       BOOST_LOG(info) << "Start capturing Video (" << num_streams << " streams, region split)"sv;
 
+      // Wait until a ping has arrived on every video socket so each stream's peer
+      // endpoint is known before encoding begins. recv_ping() above returns on the
+      // first ping on any socket; without this barrier the first frames of streams
+      // 1..N-1 would be misrouted to stream 0's port via the fallback path.
+      {
+        auto wait_start = std::chrono::steady_clock::now();
+        bool all_peers_ready = false;
+        while (std::chrono::steady_clock::now() - wait_start < config::stream.ping_timeout) {
+          {
+            std::lock_guard<std::mutex> lock(ref->video_peers_mutex);
+            all_peers_ready = true;
+            for (int i = 0; i < num_streams && i < MAX_VIDEO_STREAMS; i++) {
+              if (ref->video_peers[i].port() == 0) {
+                all_peers_ready = false;
+                break;
+              }
+            }
+          }
+          if (all_peers_ready) {
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!all_peers_ready) {
+          BOOST_LOG(warning) << "Not all video stream peers connected before timeout; "
+                                "some monitors may not receive video"sv;
+        }
+      }
+
+      // Per-monitor dimensions are derived from the combined capture size: cmd_announce
+      // set config.monitor to the combined resolution and monitors tile horizontally.
+      int per_monitor_width = num_streams > 0
+        ? session->config.monitor.width / num_streams
+        : session->config.monitor.width;
       video::capture_multi_region(
         session->mail,
         session->config.monitor,
         session,
         num_streams,
-        mm_state.per_monitor_width,
-        mm_state.per_monitor_height);
+        per_monitor_width,
+        session->config.monitor.height);
     }
   }
 

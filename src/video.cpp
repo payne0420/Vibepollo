@@ -1504,13 +1504,9 @@ namespace video {
         continue;
       }
 
-      // Check for multi-monitor composite capture
-      // Only use composite display when we have multiple actual display device IDs.
-      // When using a single combined virtual display for multi-monitor, we use
-      // regular capture at the combined resolution and let multi-region capture split it.
-      auto mm_state = config::get_multi_monitor_state();
-
-      // For multi-region capture, use display dimensions (combined) instead of encoder dimensions (per-monitor)
+      // For multi-region capture, use display dimensions (combined) instead of encoder
+      // dimensions (per-monitor). The combined virtual display is captured as one surface
+      // and capture_multi_region() crops it into per-monitor regions.
       config_t display_config = capture_ctxs.front().config;
       if (display_config.display_width > 0 && display_config.display_height > 0) {
         BOOST_LOG(info) << "Using display dimensions " << display_config.display_width << "x" << display_config.display_height
@@ -1519,16 +1515,7 @@ namespace video {
         display_config.height = display_config.display_height;
       }
 
-      if (mm_state.monitor_count > 1 && mm_state.display_device_ids.size() > 1) {
-        disp = platf::display_composite(
-          encoder.platform_formats->dev_type,
-          mm_state.display_device_ids,
-          mm_state.per_monitor_width,
-          mm_state.per_monitor_height,
-          display_config);
-      } else {
-        disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], display_config);
-      }
+      disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], display_config);
       if (disp) {
         break;
       }
@@ -2576,6 +2563,11 @@ namespace video {
 
     if (result) {
       result->colorspace = colorspace;
+      // Multi-stream region crop: tell the encode device which horizontal slice it
+      // owns and the combined source width. config.display_width is 0 for ordinary
+      // single-display capture, which leaves the crop disabled.
+      result->crop_stream_index = config.stream_index;
+      result->crop_total_width = config.display_width;
     }
 
     return result;
@@ -2880,6 +2872,12 @@ namespace video {
 
     int frame_nr = 1;
 
+    // Guards against an encoder that repeatedly fails to start: without this the loop
+    // below would re-run make_encode_device()/encode_run() with no delay, pinning a CPU
+    // core instead of failing the stream.
+    int consecutive_encode_failures = 0;
+    constexpr int max_consecutive_encode_failures = 5;
+
     auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
 
@@ -2929,6 +2927,7 @@ namespace video {
       }
       hdr_event->raise(std::move(hdr_info));
 
+      auto encode_run_begin = std::chrono::steady_clock::now();
       encode_run(
         frame_nr,
         mail,
@@ -2940,6 +2939,24 @@ namespace video {
         *ref->encoder_p,
         channel_data
       );
+
+      // If encode_run() returned almost immediately it never got a working encode
+      // session going. Back off (and eventually give up) so a persistently failing
+      // encoder doesn't busy-loop this thread.
+      if (std::chrono::steady_clock::now() - encode_run_begin < 1s) {
+        if (++consecutive_encode_failures >= max_consecutive_encode_failures) {
+          BOOST_LOG(error) << "Encoder failed to start "sv << consecutive_encode_failures
+                           << " times in a row; aborting capture for stream "sv
+                           << config.stream_index;
+          return;
+        }
+        auto backoff = std::chrono::milliseconds(200 * consecutive_encode_failures);
+        BOOST_LOG(warning) << "Encode session for stream "sv << config.stream_index
+                           << " exited immediately; retrying in "sv << backoff.count() << "ms"sv;
+        std::this_thread::sleep_for(backoff);
+      } else {
+        consecutive_encode_failures = 0;
+      }
     }
   }
 

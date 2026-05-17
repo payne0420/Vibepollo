@@ -380,6 +380,12 @@ namespace platf {
     virtual int convert(platf::img_t &img) = 0;
 
     video::sunshine_colorspace_t colorspace;
+
+    // Multi-stream region crop: the 0-based horizontal slice this encoder owns and
+    // the combined source width. crop_total_width is 0 for ordinary single-display
+    // capture, which leaves the crop disabled.
+    int crop_stream_index = 0;
+    int crop_total_width = 0;
   };
 
   struct avcodec_encode_device_t: encode_device_t {
@@ -576,22 +582,6 @@ namespace platf {
    * @return The display_t instance based on hwdevice_type.
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
-
-  /**
-   * @brief Create a composite display that captures multiple outputs and stitches them side-by-side.
-   * @param hwdevice_type Memory type for hardware encoding.
-   * @param display_names_list List of display device IDs to capture, arranged left to right.
-   * @param per_monitor_width Width of each individual monitor.
-   * @param per_monitor_height Height of each individual monitor.
-   * @param config Stream configuration.
-   * @return A display_t that produces combined frames at (per_monitor_width * N) x per_monitor_height.
-   */
-  std::shared_ptr<display_t> display_composite(
-    mem_type_e hwdevice_type,
-    const std::vector<std::string> &display_names_list,
-    int per_monitor_width,
-    int per_monitor_height,
-    const video::config_t &config);
 
   // A list of names of displays accepted as display_name with the mem_type_e
   std::vector<std::string> display_names(mem_type_e hwdevice_type);

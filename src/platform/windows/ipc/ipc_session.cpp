@@ -61,7 +61,31 @@ namespace platf::dxgi {
       _initialized = false;
       _force_reinit = true;
 
-      // Flush any pending work on the capture device before tearing down shared resources.
+      // Tear down in producer-before-consumer order so nothing can reference the
+      // shared texture (or this object) once it is released.
+      //
+      // 1. Stop the frame data path first so no new frames are delivered.
+      if (_frame_queue_pipe) {
+        _frame_queue_pipe->disconnect();
+        _frame_queue_pipe.reset();
+      }
+
+      // 2. Stop the control pipe. Resetting the AsyncNamedPipe joins its worker
+      //    thread (std::jthread) -- this is the real synchronization point: after
+      //    it returns no pipe callback can run and reach this object or the
+      //    shared texture. This replaces a former Sleep(100) race that left a
+      //    window for a callback to jump through a zeroed vtable (RIP=0x0).
+      if (_pipe) {
+        _pipe->stop();
+        _pipe.reset();
+      }
+
+      // 3. Terminate the helper process and wait for it to exit so it can no
+      //    longer write into the shared texture.
+      stop_helper_process();
+
+      // 4. Now that every producer is stopped, flush any GPU work on the capture
+      //    device that still references the shared texture before releasing it.
       if (_device) {
         winrt::com_ptr<ID3D11DeviceContext> ctx;
         _device->GetImmediateContext(ctx.put());
@@ -69,25 +93,6 @@ namespace platf::dxgi {
           ctx->Flush();
         }
       }
-
-      if (_pipe) {
-        _pipe->stop();
-        _pipe.reset();
-      }
-
-      if (_frame_queue_pipe) {
-        _frame_queue_pipe->disconnect();
-        _frame_queue_pipe.reset();
-      }
-
-      // Terminate helper process and wait for it to exit.
-      stop_helper_process();
-
-      // Wait for Windows-internal thread-pool callbacks (DXGI/composition) to
-      // drain before releasing shared resources. These callbacks run inside the
-      // main process and may still reference the shared texture/keyed mutex.
-      // Without this, a stale callback can jump through a zeroed vtable (RIP=0x0).
-      Sleep(100);
 
       _shared_texture = nullptr;
       _keyed_mutex = nullptr;

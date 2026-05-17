@@ -651,6 +651,14 @@ namespace platf::dxgi {
       float in_width = display->width;
       float in_height = display->height;
 
+      // For a multi-stream region crop, the convert pass samples only this encoder's
+      // horizontal slice of the combined capture (see ensure_crop_region()). The
+      // letterbox fit must use the per-region source width, not the full combined
+      // width -- otherwise every stream is squashed vertically by the region count.
+      if (crop_total_width > output_width && output_width > 0) {
+        in_width = (float) output_width;
+      }
+
       // Ensure aspect ratio is maintained
       auto scalar = std::fminf(out_width / in_width, out_height / in_height);
       auto out_width_f = in_width * scalar;
@@ -1131,6 +1139,11 @@ namespace platf::dxgi {
         frame_texture = (ID3D11Texture2D *) frame->data[0];
       }
 
+      // Multi-stream region crop must be configured before init_output() so its
+      // letterbox fit uses the per-region source size instead of the combined width.
+      base.stream_index = crop_stream_index;
+      base.crop_total_width = crop_total_width;
+
       return base.init_output(frame_texture, frame->width, frame->height);
     }
 
@@ -1183,15 +1196,17 @@ namespace platf::dxgi {
       }
 
       base.apply_colorspace(colorspace);
+
+      // Tell the base device which multi-stream region this encoder owns and the
+      // combined source width BEFORE init_output(), so init_output()'s letterbox
+      // fit uses the per-region source size. The crop is then applied per-frame in
+      // convert() -- see d3d_base_encode_device::ensure_crop_region().
+      base.stream_index = client_config.stream_index;
+      base.crop_total_width = client_config.display_width;
+
       if (base.init_output(nvenc_d3d->get_input_texture(), client_config.width, client_config.height) != 0) {
         return false;
       }
-
-      // Tell the base device which multi-stream region this encoder owns and
-      // the combined source width. The crop is applied per-frame in convert()
-      // -- see d3d_base_encode_device::ensure_crop_region().
-      base.stream_index = client_config.stream_index;
-      base.crop_total_width = client_config.display_width;
 
       return true;
     }
