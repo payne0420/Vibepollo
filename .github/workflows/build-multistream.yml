@@ -1,0 +1,21 @@
+---
+name: Build (multi-stream regions)
+permissions:
+  contents: read
+
+# Convenience CI for the multi-stream-regions feature branch: builds the
+# Windows installer on every push (and on demand) and uploads it as an
+# artifact, so it can be downloaded and tested without cutting a release.
+on:
+  push:
+    branches:
+      - feature/multi-stream-regions
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows installer
+    uses: ./.github/workflows/ci-windows.yml
+    with:
+      release_commit: ${{ github.sha }}
+      release_version: 0.0.0
