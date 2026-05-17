@@ -361,18 +361,6 @@ namespace platf::dxgi {
   class d3d_base_encode_device final {
   public:
     int convert(platf::img_t &img_base) {
-      // DIAG: verify crop constant buffer is bound on first convert
-      if (diag_convert_count < 3) {
-        ID3D11Buffer *bound_cb = nullptr;
-        device_ctx->VSGetConstantBuffers(4, 1, &bound_cb);
-        BOOST_LOG(info) << "DIAG convert #" << diag_convert_count
-                        << " crop_region_buf=" << (void*)crop_region.get()
-                        << " bound_b4=" << (void*)bound_cb
-                        << " match=" << (bound_cb == crop_region.get());
-        if (bound_cb) bound_cb->Release();
-        diag_convert_count++;
-      }
-
       // Garbage collect mapped capture images whose weak references have expired
       for (auto it = img_ctx_map.begin(); it != img_ctx_map.end();) {
         if (it->second.img_weak.expired()) {
@@ -460,6 +448,10 @@ namespace platf::dxgi {
         return -1;
       }
 
+      // Bind this stream's crop region immediately before the draw, so a
+      // combined multi-monitor capture is sliced to this encoder's region.
+      ensure_crop_region();
+
       // Draw captured frame
       draw(img_ctx.encoder_input_res, out_Y_or_YUV_viewports, out_UV_viewport, img.format);
 
@@ -502,54 +494,59 @@ namespace platf::dxgi {
     }
 
     /**
-     * @brief Set crop region for multi-stream capture.
+     * @brief Bind this encoder's multi-stream crop region for the current frame.
      *
-     * Configures the vertex shader to sample from a horizontal sub-region of the
-     * source texture, enabling multiple encoders to render different monitor regions
-     * from a single combined capture.
-     *
-     * @param stream_index Which stream (0, 1, 2, ...) - determines horizontal offset
-     * @param region_width Width of this stream's region (typically per-monitor width)
-     * @param total_width Total width of the combined source texture
+     * For a combined multi-monitor capture, crop_total_width is the full
+     * combined width and output_width is this encoder's per-region width, so
+     * the vertex shader samples only this encoder's horizontal slice.
+     * crop_total_width stays 0 for ordinary single-display or downscaled
+     * capture, so this never misfires on plain downscaling. The constant
+     * buffer is (re)bound on slot b4 every frame so the binding cannot be
+     * silently lost between encoder init and steady-state capture.
      */
-    void set_crop_region(int stream_index, int region_width, int total_width) {
-      if (total_width <= 0 || region_width <= 0 || stream_index < 0) {
-        BOOST_LOG(debug) << "set_crop_region: invalid params, disabling crop";
+    void ensure_crop_region() {
+      if (crop_total_width <= 0 || output_width <= 0 || stream_index < 0 ||
+          crop_total_width <= output_width) {
+        // Single-region capture: leave b4 unbound. The vertex shader treats a
+        // zero/unbound crop buffer as "no crop" (see apply_crop_transform).
         return;
       }
 
-      // Calculate UV offset and scale for horizontal cropping
-      // stream_index 0 -> offset 0.0, stream_index 1 -> offset region_width/total_width, etc.
-      float uv_offset_x = (float)(stream_index * region_width) / (float)total_width;
-      float uv_scale_x = (float)region_width / (float)total_width;
+      // Rebuild the constant buffer only when the combined width changes.
+      if (!crop_region || crop_cached_total_width != crop_total_width) {
+        // Horizontal tiling: stream i occupies [i*output_width, (i+1)*output_width).
+        const float uv_offset_x = (float) (stream_index * output_width) / (float) crop_total_width;
+        const float uv_scale_x = (float) output_width / (float) crop_total_width;
+        // float2 offset, float2 scale -- matches crop_region_cbuffer in base_vs.hlsl.
+        const float crop_data[4] = {uv_offset_x, 0.0f, uv_scale_x, 1.0f};
+        crop_region = make_buffer(device.get(), crop_data);
+        crop_cached_total_width = crop_total_width;
 
-      // Y axis: no cropping (full height)
-      float uv_offset_y = 0.0f;
-      float uv_scale_y = 1.0f;
-
-      BOOST_LOG(info) << "set_crop_region: stream=" << stream_index
-                      << " region=" << region_width << "x" << display->height
-                      << " total=" << total_width
-                      << " UV offset=" << uv_offset_x << "," << uv_offset_y
-                      << " scale=" << uv_scale_x << "," << uv_scale_y;
-
-      // Create constant buffer: float2 offset, float2 scale (16-byte aligned)
-      float crop_data[4] = {uv_offset_x, uv_offset_y, uv_scale_x, uv_scale_y};
-      crop_region = make_buffer(device.get(), crop_data);
-
-      if (!crop_region) {
-        BOOST_LOG(error) << "Failed to create crop region constant buffer";
-        return;
+        if (crop_region) {
+          BOOST_LOG(info) << "Multi-stream crop: stream=" << stream_index
+                          << " region_width=" << output_width
+                          << " total_width=" << crop_total_width
+                          << " uv_offset_x=" << uv_offset_x
+                          << " uv_scale_x=" << uv_scale_x;
+        } else {
+          BOOST_LOG(error) << "Failed to create multi-stream crop constant buffer";
+        }
       }
 
-      // Bind to slot b4 (matching HLSL cbuffer register)
-      device_ctx->VSSetConstantBuffers(4, 1, &crop_region);
+      // Bind to slot b4 (matching the HLSL cbuffer register) every frame.
+      if (crop_region) {
+        device_ctx->VSSetConstantBuffers(4, 1, &crop_region);
+      }
     }
 
     int init_output(ID3D11Texture2D *frame_texture, int width, int height) {
       // The underlying frame pool owns the texture, so we must reference it for ourselves
       frame_texture->AddRef();
       output_texture.reset(frame_texture);
+
+      // Record this encoder's output width so multi-stream crop can derive its
+      // region from the captured (combined) frame width at convert time.
+      output_width = width;
 
       HRESULT status = S_OK;
 
@@ -999,7 +996,17 @@ namespace platf::dxgi {
     }
 
     ::video::color_t *color_p;
-    int diag_convert_count = 0;  // DIAG: for one-shot logging
+
+    // Multi-stream region crop state, all set at encoder init:
+    //  - stream_index:    which horizontal region this encoder owns
+    //  - output_width:    this encoder's per-region width
+    //  - crop_total_width: combined source width (config.display_width); 0 unless
+    //                      this is a combined multi-monitor capture
+    //  - crop_cached_total_width: width the current crop_region buffer was built for
+    int stream_index = 0;
+    int output_width = 0;
+    int crop_total_width = 0;
+    int crop_cached_total_width = 0;
 
     // Keep the underlying D3D device/context alive until after all dependent resources have been released.
     device_t device;
@@ -1180,11 +1187,11 @@ namespace platf::dxgi {
         return false;
       }
 
-      // Set up crop region for multi-stream capture
-      // If display_width > 0, we're capturing a combined display and need to crop to this stream's region
-      if (client_config.display_width > 0 && client_config.display_width > client_config.width) {
-        base.set_crop_region(client_config.stream_index, client_config.width, client_config.display_width);
-      }
+      // Tell the base device which multi-stream region this encoder owns and
+      // the combined source width. The crop is applied per-frame in convert()
+      // -- see d3d_base_encode_device::ensure_crop_region().
+      base.stream_index = client_config.stream_index;
+      base.crop_total_width = client_config.display_width;
 
       return true;
     }
