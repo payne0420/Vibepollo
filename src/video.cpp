@@ -119,6 +119,22 @@ namespace video {
     }
 
     std::optional<std::string> active_virtual_display_dxgi_name() {
+      // Prefer the virtual display bound to this session's runtime output override.
+      // Each host instance records its own virtual display via
+      // config::set_runtime_output_name_override(virtual_display_device_id). Without
+      // honoring it here, an instance running alongside other instances would scan
+      // every SudoVDA display on the machine and return the first active one --
+      // capturing another instance's virtual display instead of its own.
+      const auto active_output = config::get_active_output_name();
+      if (!active_output.empty() &&
+          !boost::iequals(active_output, VDISPLAY::SUDOVDA_VIRTUAL_DISPLAY_SELECTION) &&
+          VDISPLAY::is_virtual_display_output(active_output)) {
+        const auto mapped = display_device::map_output_name(active_output);
+        if (!mapped.empty()) {
+          return mapped;
+        }
+      }
+
       auto virtual_displays = VDISPLAY::enumerateSudaVDADisplays();
       auto map_to_dxgi_name = [](const std::wstring &name) -> std::optional<std::string> {
         if (name.empty()) {
