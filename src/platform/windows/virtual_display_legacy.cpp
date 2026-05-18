@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <combaseapi.h>
+#include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <dxgi.h>
