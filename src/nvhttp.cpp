@@ -561,8 +561,6 @@ namespace nvhttp {
           // vd_width already incorporates multi_monitor_count (set above), so we always
           // create exactly one virtual display and let the standard capture pipeline handle it.
           // The client splits the wide frame across multiple windows.
-          const int vd_count = 1;
-          bool all_displays_created = true;
           launch_session->multi_virtual_displays.clear();
 
           {
@@ -610,7 +608,6 @@ namespace nvhttp {
               }
             } else {
               BOOST_LOG(warning) << "Virtual display creation failed.";
-              all_displays_created = false;
             }
           }
 
