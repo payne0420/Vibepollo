@@ -815,15 +815,35 @@ namespace stream {
 
       auto aligned_data_shards = payload_size / blocksize;
       auto data_shards = aligned_data_shards + (pad ? 1 : 0);
-      auto parity_shards = (data_shards * fecpercentage + 99) / 100;
 
-      // increase the FEC percentage for this frame if the parity shard minimum is not met
-      if (parity_shards < minparityshards && fecpercentage != 0) {
-        parity_shards = minparityshards;
-        fecpercentage = (100 * parity_shards) / data_shards;
+      auto parity_for_percentage = [data_shards](size_t percentage) {
+        return percentage == 0 ? 0 : (data_shards * percentage + 99) / 100;
+      };
 
-        BOOST_LOG(verbose) << "Increasing FEC percentage to "sv << fecpercentage << " to meet parity shard minimum"sv << std::endl;
+      // Keep the wire FEC percentage representable by both ends. Moonlight derives
+      // parity count from fecInfo.percentage, so the server must not silently send
+      // fewer or more parity shards than that percentage implies.
+      if (fecpercentage != 0) {
+        if (data_shards == 0 || data_shards >= DATA_SHARDS_MAX) {
+          BOOST_LOG(warning) << "Disabling FEC for oversized block ("sv << data_shards << " data shards)"sv;
+          fecpercentage = 0;
+        } else {
+          if (minparityshards != 0 && parity_for_percentage(fecpercentage) < minparityshards) {
+            fecpercentage = (minparityshards * 100 + data_shards - 1) / data_shards;
+            BOOST_LOG(verbose) << "Increasing FEC percentage to "sv << fecpercentage << " to meet parity shard minimum"sv << std::endl;
+          }
+
+          while (fecpercentage != 0 && data_shards + parity_for_percentage(fecpercentage) > DATA_SHARDS_MAX) {
+            --fecpercentage;
+          }
+
+          if (fecpercentage == 0) {
+            BOOST_LOG(warning) << "Disabling FEC for oversized block ("sv << data_shards << " data shards)"sv;
+          }
+        }
       }
+
+      auto parity_shards = parity_for_percentage(fecpercentage);
 
       auto nr_shards = data_shards + parity_shards;
 
@@ -1693,6 +1713,10 @@ namespace stream {
       // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
       constexpr auto MAX_FEC_BLOCKS = 4;
 
+      auto parity_shards_for_percentage = [](size_t data_shards, size_t percentage) {
+        return percentage == 0 ? 0 : (data_shards * percentage + 99) / 100;
+      };
+
       // The max number of data shards per block is found by solving this system of equations for D:
       // D = 255 - P
       // P = D * F
@@ -1706,12 +1730,28 @@ namespace stream {
       auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;
       auto fec_blocks_needed = (payload.size() + (max_data_per_fec_block - 1)) / max_data_per_fec_block;
 
-      // If the number of FEC blocks needed exceeds the protocol limit, turn off FEC for this frame.
-      // For normal FEC percentages, this should only happen for enormous frames (over 800 packets at 20%).
+      // If the configured FEC percentage won't fit within the protocol's 4-block
+      // limit, reduce FEC to the highest percentage that still fits instead of
+      // disabling it outright. Recovery IDRs are often the largest frames; sending
+      // them with zero FEC makes a single dropped UDP packet keep the stream stuck
+      // in "waiting for IDR" forever.
       if (fec_blocks_needed > MAX_FEC_BLOCKS) {
-        BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame (needed "sv << fec_blocks_needed << " FEC blocks)"sv;
-        fecPercentage = 0;
         fec_blocks_needed = MAX_FEC_BLOCKS;
+
+        auto data_shards_per_block = (payload.size() + (blocksize * fec_blocks_needed) - 1) / (blocksize * fec_blocks_needed);
+        auto reducedFecPercentage = fecPercentage;
+        while (reducedFecPercentage != 0 &&
+               (data_shards_per_block >= DATA_SHARDS_MAX ||
+                data_shards_per_block + parity_shards_for_percentage(data_shards_per_block, reducedFecPercentage) > DATA_SHARDS_MAX)) {
+          --reducedFecPercentage;
+        }
+
+        if (reducedFecPercentage != fecPercentage) {
+          BOOST_LOG(warning) << "Reducing FEC for large encoded frame from "sv << fecPercentage << "% to "sv
+                             << reducedFecPercentage << "% ("sv << data_shards_per_block
+                             << " data shards/block)"sv;
+          fecPercentage = reducedFecPercentage;
+        }
       }
 
       std::array<std::string_view, MAX_FEC_BLOCKS> fec_blocks;
