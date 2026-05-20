@@ -1745,6 +1745,21 @@ namespace stream {
         // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
         size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
 
+        // Multi-stream burst budget: each video stream has its own broadcast thread
+        // running this pacer, so N streams can collectively burst N * 800 Mbps.
+        // With 3 streams that's ~2.4 Gbps -- far above a 1 Gbps NIC, which then
+        // drops packets during simultaneous large frames. The receiver can't FEC-
+        // recover those (FEC is auto-disabled past ~880 KB / 4 blocks), so any
+        // dropped IDR packet triggers a per-stream IDR storm and the stream hangs.
+        // Divide the per-stream burst budget by the number of streams so the
+        // combined cap stays at ~800 Mbps. Single-stream sessions are unaffected.
+        if (session->config.numVideoStreams > 1) {
+          ratecontrol_packets_in_1ms /= session->config.numVideoStreams;
+          if (ratecontrol_packets_in_1ms == 0) {
+            ratecontrol_packets_in_1ms = 1;  // never stall at zero
+          }
+        }
+
         // Send less than 64K in a single batch.
         // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,
         // appear in "Other I/O" and begin waiting for interrupts.
@@ -2094,7 +2109,12 @@ namespace stream {
       }
 
       try {
-        sock->set_option(boost::asio::socket_base::send_buffer_size(1024 * 1024));
+        // Larger SO_SNDBUF (was 1 MB) absorbs encoder bursts during IDRs at
+        // high per-stream bitrates so blocking sendmsg() doesn't stall the
+        // broadcast thread. At 100 Mbps, 4 MB is ~320 ms of frames -- enough
+        // to ride out momentary NIC backpressure when multiple streams send
+        // large frames in the same window.
+        sock->set_option(boost::asio::socket_base::send_buffer_size(4 * 1024 * 1024));
       } catch (...) {
         BOOST_LOG(error) << "Failed to set video socket send buffer size (SO_SENDBUF) for stream " << i;
       }
