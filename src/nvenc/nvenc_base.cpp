@@ -457,10 +457,32 @@ namespace nvenc {
     enc_config.rcParams.averageBitRate = client_config.bitrate * 1000;
 
     if (get_encoder_cap(NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE)) {
-      enc_config.rcParams.vbvBufferSize = client_config.bitrate * 1000 / client_config.framerate;
+      uint64_t natural_vbv_bits = (uint64_t) client_config.bitrate * 1000 / client_config.framerate;
       if (config.vbv_percentage_increase > 0) {
-        enc_config.rcParams.vbvBufferSize += enc_config.rcParams.vbvBufferSize * config.vbv_percentage_increase / 100;
+        natural_vbv_bits += natural_vbv_bits * config.vbv_percentage_increase / 100;
       }
+
+      // FEC cliff: the wire protocol carries at most 4 FEC blocks per frame
+      // (2-bit field in NV_VIDEO_PACKET::multiFecBlocks) and 255 data shards
+      // per block (DATA_SHARDS_MAX). Above 4 * 255 * (packetSize +
+      // MAX_RTP_HEADER_SIZE) bytes per frame, src/stream.cpp falls back to
+      // sending the frame with FEC disabled, and a single dropped UDP packet
+      // is then unrecoverable. The client then requests an IDR, the server
+      // re-emits another oversized FEC-disabled IDR, and the stream hangs in
+      // a feedback loop. Use the conservative 1024-byte packet bound (which
+      // applies on VPN / remote streaming) so the cap is safe on every
+      // transport; on LAN this leaves ~25% headroom under the real ceiling.
+      constexpr uint64_t FEC_RECOVERABLE_BITS_PER_FRAME = 4ull * 255ull * (1024ull + 16ull) * 8ull;
+      if (natural_vbv_bits > FEC_RECOVERABLE_BITS_PER_FRAME) {
+        BOOST_LOG(info) << "NvEnc: capping VBV from " << natural_vbv_bits / 8 / 1024
+                        << " KB to " << FEC_RECOVERABLE_BITS_PER_FRAME / 8 / 1024
+                        << " KB to keep IDRs FEC-recoverable (bitrate "
+                        << client_config.bitrate << " kbps, fps "
+                        << client_config.framerate << ")";
+        natural_vbv_bits = FEC_RECOVERABLE_BITS_PER_FRAME;
+      }
+
+      enc_config.rcParams.vbvBufferSize = static_cast<uint32_t>(natural_vbv_bits);
     }
 
     auto set_h264_hevc_common_format_config = [&](auto &format_config) {
