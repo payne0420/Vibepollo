@@ -71,6 +71,7 @@ extern "C" {
 #define IDX_SET_CLIPBOARD 16
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 17
 #define IDX_SET_ADAPTIVE_TRIGGERS 18
+#define IDX_REQUEST_IDR_FRAME_PER_STREAM 19
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -92,6 +93,7 @@ static const short packetTypes[] = {
   0x3001,  // Set Clipboard (Apollo protocol extension)
   0x3002,  // File transfer nonce request (Apollo protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
+  0x5504,  // Request IDR frame for a single stream (Apollo multi-stream extension)
 };
 
 namespace asio = boost::asio;
@@ -1153,6 +1155,27 @@ namespace stream {
       for (int i = 0; i < std::max(1, session->config.numVideoStreams); i++) {
         session->mail->event<bool>(mail::idr_name(i))->raise(true);
       }
+    });
+
+    server->map(packetTypes[IDX_REQUEST_IDR_FRAME_PER_STREAM], [&](session_t *session, const std::string_view &payload) {
+      // 0x5504 carries a single byte: the stream index that needs a new IDR.
+      // Raising the IDR event only for that one stream avoids the simultaneous
+      // burst of every encoder emitting an IDR (each IDR is ~5--10x a P-frame)
+      // which is what caused multi-monitor sessions to collapse into a
+      // congestion-loss feedback loop after even a single packet drop.
+      if (payload.size() < 1) {
+        BOOST_LOG(warning) << "type [IDX_REQUEST_IDR_FRAME_PER_STREAM] runt payload (size=" << payload.size() << ")";
+        return;
+      }
+      uint8_t stream_index = (uint8_t) payload[0];
+      const int num_streams = std::max(1, session->config.numVideoStreams);
+      if (stream_index >= num_streams) {
+        BOOST_LOG(warning) << "type [IDX_REQUEST_IDR_FRAME_PER_STREAM] stream " << (int) stream_index
+                           << " out of range (numVideoStreams=" << num_streams << ")"sv;
+        return;
+      }
+      BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME_PER_STREAM] stream=" << (int) stream_index;
+      session->mail->event<bool>(mail::idr_name(stream_index))->raise(true);
     });
 
     server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {

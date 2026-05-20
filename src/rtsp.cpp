@@ -907,6 +907,10 @@ namespace rtsp_stream {
     ss << "a=x-ss-general.encryptionSupported:" << encryption_flags_supported << std::endl;
     ss << "a=x-ss-general.encryptionRequested:" << encryption_flags_requested << std::endl;
     ss << "a=x-ss-general.multiStreamSupported:1" << std::endl;
+    // Per-stream IDR control message (0x5504): when a single stream loses
+    // packets the client targets only that stream's encoder, avoiding the
+    // simultaneous IDR burst across every monitor that a global IDR causes.
+    ss << "a=x-ss-general.perStreamIdrSupported:1" << std::endl;
 
     if (video::last_encoder_probe_supported_ref_frames_invalidation) {
       ss << "a=x-nv-video[0].refPicInvalidation:1"sv << std::endl;

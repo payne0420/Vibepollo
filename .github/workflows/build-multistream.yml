@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - feature/multi-stream-regions
+      - ms-regions
   workflow_dispatch:
 
 jobs:
