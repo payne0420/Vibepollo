@@ -1498,14 +1498,13 @@ namespace stream {
 
     auto &io = ctx.io_context;
 
-    udp::endpoint peer;
-
     // N video sockets + 1 audio socket
     const int num_video = (int) ctx.video_socks.size();
     const int total_sockets = num_video + 1;
     const int audio_idx = num_video;  // audio is the last element
 
     std::vector<std::array<char, 2048>> buf(total_sockets);
+    std::vector<udp::endpoint> peers(total_sockets);
     std::vector<std::function<void(const boost::system::error_code, size_t)>> recv_func(total_sockets);
 
     auto populate_peer_to_session = [&]() {
@@ -1533,9 +1532,11 @@ namespace stream {
     };
 
     auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session, std::string_view type_str, int video_stream_idx) {
-      recv_func[buf_elem] = [&, buf_elem, type_str, video_stream_idx](const boost::system::error_code &ec, size_t bytes) {
+      auto *sock_ptr = &sock;
+      recv_func[buf_elem] = [&, sock_ptr, buf_elem, type_str, video_stream_idx](const boost::system::error_code &ec, size_t bytes) {
+        auto &peer = peers[buf_elem];
         auto fg = util::fail_guard([&]() {
-          sock.async_receive_from(asio::buffer(buf[buf_elem]), peer, 0, recv_func[buf_elem]);
+          sock_ptr->async_receive_from(asio::buffer(buf[buf_elem]), peer, 0, recv_func[buf_elem]);
         });
 
         BOOST_LOG(verbose) << "Recv: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
@@ -1584,9 +1585,9 @@ namespace stream {
 
     // Start async receives on all sockets
     for (int i = 0; i < num_video; i++) {
-      ctx.video_socks[i]->async_receive_from(asio::buffer(buf[i]), peer, 0, recv_func[i]);
+      ctx.video_socks[i]->async_receive_from(asio::buffer(buf[i]), peers[i], 0, recv_func[i]);
     }
-    audio_sock.async_receive_from(asio::buffer(buf[audio_idx]), peer, 0, recv_func[audio_idx]);
+    audio_sock.async_receive_from(asio::buffer(buf[audio_idx]), peers[audio_idx], 0, recv_func[audio_idx]);
 
     while (!broadcast_shutdown_event->peek()) {
       io.run();
@@ -2097,6 +2098,10 @@ namespace stream {
     int num_video_streams = MAX_VIDEO_STREAMS;
 
     ctx.video_socks.clear();
+    {
+      std::lock_guard<std::mutex> lock(ctx.video_peers_mutex);
+      std::fill(std::begin(ctx.video_peers), std::end(ctx.video_peers), udp::endpoint {});
+    }
     for (int i = 0; i < num_video_streams; i++) {
       auto video_port = net::map_port(video_stream_port(i));
 
