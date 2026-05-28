@@ -127,6 +127,16 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/http_auth.cpp"
         "${CMAKE_SOURCE_DIR}/src/state_storage.cpp"
         "${CMAKE_SOURCE_DIR}/src/state_storage.h"
+        "${CMAKE_SOURCE_DIR}/src/session_history.cpp"
+        "${CMAKE_SOURCE_DIR}/src/session_history.h"
+        "${CMAKE_SOURCE_DIR}/src/session_history_sampler.cpp"
+        "${CMAKE_SOURCE_DIR}/src/session_history_sampler.h"
+        "${CMAKE_SOURCE_DIR}/src/session_history_storage.cpp"
+        "${CMAKE_SOURCE_DIR}/src/session_history_storage.h"
+        "${CMAKE_SOURCE_DIR}/src/session_history_writer.cpp"
+        "${CMAKE_SOURCE_DIR}/src/session_history_writer.h"
+        "${CMAKE_SOURCE_DIR}/src/host_stats.cpp"
+        "${CMAKE_SOURCE_DIR}/src/host_stats.h"
         ${PLATFORM_TARGET_FILES})
 
 if(NOT SUNSHINE_ASSETS_DIR_DEF)
@@ -147,9 +157,13 @@ include_directories(BEFORE "${CMAKE_SOURCE_DIR}")
 
 set(SUNSHINE_FFMPEG_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIRS})
 if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # The prepared FFmpeg headers must win over MSYS2's system FFmpeg headers
+    # (which can be older and lack macros like AV_HAS_ATTRIBUTE used by the
+    # bundled internal headers). Use -isystem with -iquote-style precedence so
+    # they are searched before /ucrt64/include.
     set(SUNSHINE_FFMPEG_INCLUDE_DIRS "")
     foreach(ffmpeg_dir IN LISTS FFMPEG_INCLUDE_DIRS)
-        add_compile_options("-idirafter" "${ffmpeg_dir}")
+        add_compile_options("-isystem" "${ffmpeg_dir}")
     endforeach()
 endif()
 
@@ -161,6 +175,7 @@ include_directories(
         "${CMAKE_SOURCE_DIR}/third-party/nanors"
         "${CMAKE_SOURCE_DIR}/third-party/nanors/deps/obl"
         ${WEBRTC_INCLUDE_DIRS}
+        ${SQLITE3_INCLUDE_DIRS}
         ${SUNSHINE_FFMPEG_INCLUDE_DIRS}
         ${Boost_INCLUDE_DIRS}  # has to be the last, or we get runtime error on macOS ffmpeg encoder
 )
@@ -168,6 +183,7 @@ include_directories(
 list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
         ${MINIUPNP_LIBRARIES}
         ${CMAKE_THREAD_LIBS_INIT}
+        ${SQLITE3_LIBRARIES}
         enet
         libdisplaydevice::display_device
         nlohmann_json::nlohmann_json

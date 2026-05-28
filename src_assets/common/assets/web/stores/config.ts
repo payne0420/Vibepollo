@@ -72,6 +72,9 @@ const defaultGroups = [
       update_check_interval: 86400,
       session_token_ttl_seconds: 86400,
       remember_me_refresh_token_ttl_seconds: 604800,
+      session_history_enabled: 'enabled',
+      session_history_ttl_days: 0,
+      session_history_db_size_limit_mb: 0,
       system_tray: true,
       hide_tray_controls: 'disabled',
     },
@@ -156,6 +159,7 @@ const defaultGroups = [
       lan_encryption_mode: 0,
       wan_encryption_mode: 1,
       ping_timeout: 10000,
+      video_max_batch_size_kb: 64,
     },
   },
   {

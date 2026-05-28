@@ -414,7 +414,14 @@ namespace rtsp_stream {
 
       acceptor.set_option(boost::asio::socket_base::reuse_address {true});
 
-      acceptor.bind(tcp::endpoint(af == net::IPV4 ? tcp::v4() : tcp::v6(), port), ec);
+      const auto bind_addr_str = net::get_bind_address(af);
+      const auto bind_addr = boost::asio::ip::make_address(bind_addr_str, ec);
+      if (ec) {
+        BOOST_LOG(error) << "Invalid bind address: "sv << bind_addr_str << " - " << ec.message();
+        return -1;
+      }
+
+      acceptor.bind(tcp::endpoint(bind_addr, port), ec);
       if (ec) {
         return -1;
       }
@@ -699,6 +706,17 @@ namespace rtsp_stream {
       return uuids;
     }
 
+    std::vector<std::shared_ptr<stream::session_t>>
+      get_sessions_snapshot() {
+      std::vector<std::shared_ptr<stream::session_t>> sessions;
+      auto lg = _session_state.lock();
+      sessions.reserve(_session_state->sessions.size());
+      for (auto &session : _session_state->sessions) {
+        sessions.push_back(session);
+      }
+      return sessions;
+    }
+
   private:
     std::unordered_map<std::string_view, cmd_func_t> _map_cmd_cb;
 
@@ -739,6 +757,10 @@ namespace rtsp_stream {
 
   std::list<std::string> get_all_session_uuids() {
     return server.get_all_session_uuids();
+  }
+
+  std::vector<std::shared_ptr<stream::session_t>> get_sessions_snapshot() {
+    return server.get_sessions_snapshot();
   }
 
   void terminate_sessions() {
@@ -1135,6 +1157,7 @@ namespace rtsp_stream {
       config.monitor.framerate = util::from_view(args.at("x-nv-video[0].maxFPS"sv));
       config.monitor.framerateX100 = util::from_view(args.at("x-nv-video[0].clientRefreshRateX100"sv));
       config.monitor.bitrate = util::from_view(args.at("x-nv-vqos[0].bw.maximumBitrateKbps"sv));
+      config.monitor.client_requested_bitrate = config.monitor.bitrate;
       config.monitor.slicesPerFrame = util::from_view(args.at("x-nv-video[0].videoEncoderSlicesPerFrame"sv));
       config.monitor.numRefFrames = util::from_view(args.at("x-nv-video[0].maxNumReferenceFrames"sv));
       config.monitor.encoderCscMode = util::from_view(args.at("x-nv-video[0].encoderCscMode"sv));
@@ -1270,10 +1293,14 @@ namespace rtsp_stream {
     // Prefer 10-bit SDR encoding when enabled globally or overridden per-client.
     const auto client_prefer_10bit_sdr_override = nvhttp::get_client_prefer_10bit_sdr_override(session.client_uuid);
     const bool prefer_10bit_sdr = client_prefer_10bit_sdr_override.value_or(config::video.prefer_10bit_sdr);
-    if (prefer_10bit_sdr && !session.enable_hdr && config.monitor.dynamicRange == 0) {
-      const bool hevc_main10 = config.monitor.videoFormat == 1 && video::active_hevc_mode >= 3;
-      const bool av1_main10 = config.monitor.videoFormat == 2 && video::active_av1_mode >= 3;
-      if (hevc_main10 || av1_main10) {
+    const bool hevc_main10 = config.monitor.videoFormat == 1 && video::active_hevc_mode >= 3;
+    const bool av1_main10 = config.monitor.videoFormat == 2 && video::active_av1_mode >= 3;
+    const bool supports_10bit_dynamic_range = hevc_main10 || av1_main10;
+    if (config.monitor.dynamicRange == 0) {
+      if (session.enable_hdr && supports_10bit_dynamic_range) {
+        BOOST_LOG(info) << "RTSP ANNOUNCE requested SDR while launch HDR is enabled; using HDR 10-bit encode";
+        config.monitor.dynamicRange = 1;
+      } else if (prefer_10bit_sdr && !session.enable_hdr && supports_10bit_dynamic_range) {
         BOOST_LOG(info) << "Preferring 10-bit SDR encode for compatible client request";
         config.monitor.dynamicRange = 1;
         config.monitor.prefer_sdr_10bit = true;
@@ -1286,6 +1313,10 @@ namespace rtsp_stream {
     // down to nearly nothing.
     if (configuredBitrateKbps) {
       BOOST_LOG(debug) << "Client configured bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
+
+      // Preserve the original wire-bandwidth budget the client asked for so the
+      // UI can show it alongside the post-adjustment encoder bitrate.
+      config.monitor.client_requested_bitrate = static_cast<int>(configuredBitrateKbps);
 
       // If the FEC percentage isn't too high, adjust the configured bitrate to ensure video
       // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.

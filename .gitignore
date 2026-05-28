@@ -45,6 +45,7 @@ docs/doxyconfig*
 # npm
 node_modules/
 package-lock.json
+!src_assets/common/assets/web/package-lock.json
 
 # Translations
 *.mo
@@ -60,3 +61,8 @@ _codeql_detected_source_root
 
 build-msvc
 .cache/
+
+# Local-only Copilot instructions (not committed)
+.github/copilot-instructions.md
+/build_release
+

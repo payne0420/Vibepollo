@@ -60,8 +60,11 @@ using namespace std::literals;
 
 namespace video {
 
+  /**
+   * @brief Check if we can allow probing for the encoders.
+   * @return True if there should be no issues with the probing, false if we should prevent it.
+   */
   bool allow_encoder_probing() {
-    // Always allow probing; previous in-process display checks removed.
     return true;
   }
 
@@ -70,6 +73,13 @@ namespace video {
     bool should_prefer_virtual_display() {
       if (platf::is_lock_screen_active() && VDISPLAY::has_active_physical_display()) {
         return false;
+      }
+
+      if (auto runtime_output_name = config::runtime_output_name_override()) {
+        if (!runtime_output_name->empty()) {
+          return boost::iequals(*runtime_output_name, VDISPLAY::SUDOVDA_VIRTUAL_DISPLAY_SELECTION) ||
+                 VDISPLAY::is_virtual_display_output(*runtime_output_name);
+        }
       }
 
       if (!VDISPLAY::isSudaVDADriverInstalled()) {
@@ -1376,6 +1386,8 @@ namespace video {
    */
   void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index, std::string &preferred_display_name) {
     // It is possible that the output name may be empty even if it wasn't before (device disconnected) or vice-versa
+    const auto runtime_output_override = config::runtime_output_name_override();
+    const bool has_runtime_output_override = runtime_output_override && !runtime_output_override->empty();
     const auto output_name = display_device::map_output_name(config::get_active_output_name());
     std::string current_display_name;
     auto names_match = [](const std::string &lhs, const std::string &rhs) {
@@ -1421,6 +1433,19 @@ namespace video {
 
     // We now have a new display name list, so reset the index back to 0
     current_display_index = 0;
+
+    if (has_runtime_output_override && !output_name.empty()) {
+      for (int x = 0; x < display_names.size(); ++x) {
+        if (names_match(display_names[x], output_name)) {
+          current_display_index = x;
+          return;
+        }
+      }
+
+      BOOST_LOG(warning) << "Runtime display override [" << *runtime_output_override
+                         << "] mapped to [" << output_name
+                         << "] but was not found in the capture display list";
+    }
 
     if (current_display_name.empty()) {
       current_display_name = display_device::map_output_name(config::video.output_name);
@@ -1537,6 +1562,7 @@ namespace video {
 
     constexpr auto capture_buffer_size = 12;
     std::list<std::shared_ptr<platf::img_t>> imgs(capture_buffer_size);
+    uint64_t image_pool_wait_count = 0;
 
     std::vector<std::optional<std::chrono::steady_clock::time_point>> imgs_used_timestamps;
     const std::chrono::seconds trim_timeot = 3s;
@@ -1590,6 +1616,8 @@ namespace video {
 
     auto pull_free_image_callback = [&](std::shared_ptr<platf::img_t> &img_out) -> bool {
       img_out.reset();
+      std::optional<std::chrono::steady_clock::time_point> wait_start;
+      uint32_t wait_iterations = 0;
       while (capture_ctx_queue->running()) {
         // pick first allocated but unused
         for (auto it = imgs.begin(); it != imgs.end(); it++) {
@@ -1620,11 +1648,27 @@ namespace video {
           }
         }
         if (img_out) {
+          if (wait_start) {
+            const auto wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - *wait_start).count();
+            ++image_pool_wait_count;
+            if (image_pool_wait_count <= 5 || wait_ms > 1.5 || image_pool_wait_count % 120 == 0) {
+              BOOST_LOG(debug) << "Capture image pool waited " << wait_ms
+                               << "ms for a free image"
+                               << " iterations=" << wait_iterations
+                               << " count=" << image_pool_wait_count;
+            }
+          }
+
           // trim allocated but unused portion of the pool based on timeouts
           trim_imgs();
           img_out->frame_timestamp.reset();
+          img_out->capture_pacing_timestamp.reset();
           return true;
         } else {
+          if (!wait_start) {
+            wait_start = std::chrono::steady_clock::now();
+          }
+          ++wait_iterations;
           // sleep and retry if image pool is full
           std::this_thread::sleep_for(1ms);
         }
@@ -1789,7 +1833,8 @@ namespace video {
     safe::mail_raw_t::queue_t<packet_t> &packets,
     void *channel_data,
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
-    std::optional<std::chrono::steady_clock::time_point> capture_timestamp
+    std::optional<std::chrono::steady_clock::time_point> capture_timestamp,
+    std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp
   ) {
     auto &frame = session.device->frame;
     frame->pts = frame_nr;
@@ -1855,6 +1900,7 @@ namespace video {
       if (av_packet && av_packet->pts == frame_nr) {
         packet->frame_timestamp = frame_timestamp;
         packet->capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
+        packet->host_processing_timestamp = host_processing_timestamp;
       }
 
       packet->replacements = &session.replacements;
@@ -1874,7 +1920,8 @@ namespace video {
     safe::mail_raw_t::queue_t<packet_t> &packets,
     void *channel_data,
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
-    std::optional<std::chrono::steady_clock::time_point> capture_timestamp
+    std::optional<std::chrono::steady_clock::time_point> capture_timestamp,
+    std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp
   ) {
     auto encoded_frame = session.encode_frame(frame_nr);
     if (encoded_frame.data.empty()) {
@@ -1891,6 +1938,7 @@ namespace video {
     packet->after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
     packet->frame_timestamp = frame_timestamp;
     packet->capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
+    packet->host_processing_timestamp = host_processing_timestamp;
     if (webrtc_stream::has_active_sessions()) {
       webrtc_stream::submit_video_packet(*packet);
     }
@@ -1905,12 +1953,13 @@ namespace video {
     safe::mail_raw_t::queue_t<packet_t> &packets,
     void *channel_data,
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
-    std::optional<std::chrono::steady_clock::time_point> capture_timestamp
+    std::optional<std::chrono::steady_clock::time_point> capture_timestamp,
+    std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp
   ) {
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
-      return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp, capture_timestamp);
+      return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
-      return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp, capture_timestamp);
+      return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp);
     }
 
     return -1;
@@ -2376,7 +2425,7 @@ namespace video {
 
       // Encode the dummy img only once
       const auto now = std::chrono::steady_clock::now();
-      if (encode(frame_nr++, *session, packets, channel_data, now, now)) {
+      if (encode(frame_nr++, *session, packets, channel_data, now, now, now)) {
         BOOST_LOG(error) << "Could not encode dummy video packet"sv;
         return;
       }
@@ -2424,6 +2473,7 @@ namespace video {
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
       std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
+      std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
       bool placeholder_input = bootstrap_state.current_input_placeholder;
 
       // Encode at a minimum FPS to avoid image quality issues with static content
@@ -2436,6 +2486,7 @@ namespace video {
           if (!placeholder_input) {
             capture_timestamp = img->frame_timestamp;
             frame_timestamp = capture_timestamp;
+            host_processing_timestamp = img->host_processing_timestamp;
           }
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
@@ -2462,6 +2513,7 @@ namespace video {
             *encode_frame_timestamp += encode_frame_threshold;
           } else {
             frame_timestamp.reset();
+            host_processing_timestamp.reset();
           }
         } else if (!images->running()) {
           break;
@@ -2474,7 +2526,7 @@ namespace video {
         continue;
       }
 
-      if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp, capture_timestamp)) {
+      if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         break;
       }
@@ -2740,6 +2792,7 @@ namespace video {
 
           std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
           std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
+          std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
           bool placeholder_input = pos->bootstrap.current_input_placeholder;
 
           if (frame_captured) {
@@ -2750,6 +2803,7 @@ namespace video {
 
             if (!placeholder_input) {
               capture_timestamp = img->frame_timestamp;
+              host_processing_timestamp = img->host_processing_timestamp;
             }
 
             if (pos->session->convert(*img)) {
@@ -2774,7 +2828,7 @@ namespace video {
             continue;
           }
 
-          if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp, capture_timestamp)) {
+          if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp, capture_timestamp, host_processing_timestamp)) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
             ctx->shutdown_event->raise(true);
 
@@ -2801,6 +2855,7 @@ namespace video {
       auto pull_free_image_callback = [&img](std::shared_ptr<platf::img_t> &img_out) -> bool {
         img_out = img;
         img_out->frame_timestamp.reset();
+        img_out->capture_pacing_timestamp.reset();
         return true;
       };
 
@@ -3099,7 +3154,7 @@ namespace video {
         auto packets = probe_mail->queue<packet_t>(mail::video_packets);
 
         while (!packets->peek()) {
-          if (encode(1, *session, packets, nullptr, {}, {})) {
+          if (encode(1, *session, packets, nullptr, {}, {}, {})) {
             return util::false_v<util::optional_t<int>>;
           }
         }
@@ -3312,25 +3367,27 @@ namespace video {
 
         auto encoder_codec_name = encoder.codec_from_config(config).name;
 
-        // Test 4:4:4 HDR first. If 4:4:4 is supported, 4:2:0 should also be supported.
-        config.chromaSamplingType = 1;
-        if ((encoder.flags & YUV444_SUPPORT) &&
-            disp->is_codec_supported(encoder_codec_name, config) &&
-            validate_config(disp, encoder, config) >= 0) {
-          flag_map[encoder_t::DYNAMIC_RANGE] = true;
-          flag_map[encoder_t::YUV444] = true;
-          return;
-        } else {
-          flag_map[encoder_t::YUV444] = false;
-        }
+        flag_map[encoder_t::YUV444] = false;
 
-        // Test 4:2:0 HDR
+        // Test the mandatory HDR 4:2:0 path first. Some encoders support AV1/HEVC
+        // Main10 but reject optional 4:4:4, and that must not mask HDR support.
+        // Keep DYNAMIC_RANGE tentatively enabled while probing because validate_config()
+        // gates dynamicRange configs on the current codec capability bit.
         config.chromaSamplingType = 0;
         if (disp->is_codec_supported(encoder_codec_name, config) &&
             validate_config(disp, encoder, config) >= 0) {
           flag_map[encoder_t::DYNAMIC_RANGE] = true;
         } else {
           flag_map[encoder_t::DYNAMIC_RANGE] = false;
+          return;
+        }
+
+        // Test optional HDR 4:4:4 after 4:2:0 has already established HDR support.
+        config.chromaSamplingType = 1;
+        if ((encoder.flags & YUV444_SUPPORT) &&
+            disp->is_codec_supported(encoder_codec_name, config) &&
+            validate_config(disp, encoder, config) >= 0) {
+          flag_map[encoder_t::YUV444] = true;
         }
       };
 
@@ -3357,7 +3414,6 @@ namespace video {
 
   int probe_encoders() {
     std::lock_guard<std::mutex> lock(encoder_probe_mutex);
-    encoder_probe_attempted.store(true, std::memory_order_release);
     const auto cache_key = build_probe_cache_key();
     const bool hevc_mode_auto = config::video.hevc_mode == 0;
     const bool av1_mode_auto = config::video.av1_mode == 0;
@@ -3368,6 +3424,7 @@ namespace video {
     const bool wants_av1_hdr = config::video.av1_mode == 3 || av1_mode_auto;
 
     if (probe_cache_matches(cache_key, wants_hdr, wants_hevc, wants_hevc_hdr, wants_av1, wants_av1_hdr)) {
+      encoder_probe_attempted.store(true, std::memory_order_release);
       BOOST_LOG(debug) << "Encoder probe skipped (cached success).";
       return 0;
     }
@@ -3377,6 +3434,7 @@ namespace video {
       update_probe_cache(cache_key, false, false, false, false, false, false);
       return -1;
     }
+    encoder_probe_attempted.store(true, std::memory_order_release);
 
     const auto previous_active_hevc_mode = active_hevc_mode;
     const auto previous_active_av1_mode = active_av1_mode;

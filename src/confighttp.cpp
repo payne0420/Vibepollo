@@ -12,8 +12,9 @@
 #include <boost/regex.hpp>
 #include <cctype>
 #include <chrono>
-#include <filesystem>
+#include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <future>
@@ -25,6 +26,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 
 // lib includes
 #include <boost/algorithm/string.hpp>
@@ -52,6 +54,10 @@
 #include "network.h"
 #include "nvhttp.h"
 #include "platform/common.h"
+#include "rtsp.h"
+#include "session_history.h"
+#include "stream.h"
+#include "host_stats.h"
 #include "webrtc_stream.h"
 
 #ifdef _WIN32
@@ -348,6 +354,35 @@ namespace confighttp {
       return token_route_catalog;
     }
 
+    bool has_active_stream_sessions() {
+      return rtsp_stream::session_count() > 0 || webrtc_stream::has_active_sessions();
+    }
+
+    bool can_hot_apply_during_session(const std::set<std::string> &keys) {
+      if (keys.empty()) {
+        return false;
+      }
+
+      for (const auto &key : keys) {
+        if (key.rfind("playnite_", 0) == 0) {
+          continue;
+        }
+
+        if (key == "session_history_enabled") {
+          return false;
+        }
+
+        if (key == "session_history_ttl_days" ||
+            key == "session_history_db_size_limit_mb") {
+          continue;
+        }
+
+        return false;
+      }
+
+      return true;
+    }
+
   }  // namespace
 
   // Forward declaration for error helper implemented later
@@ -484,8 +519,13 @@ namespace confighttp {
     output["height"] = state.height ? nlohmann::json(*state.height) : nlohmann::json(nullptr);
     output["fps"] = state.fps ? nlohmann::json(*state.fps) : nlohmann::json(nullptr);
     output["bitrate_kbps"] = state.bitrate_kbps ? nlohmann::json(*state.bitrate_kbps) : nlohmann::json(nullptr);
-    output["codec"] = state.codec ? nlohmann::json(*state.codec) : nlohmann::json(nullptr);
+    // WebRTC has no FEC/audio adjustment, so the requested bitrate is the same as the encoder bitrate.
+    output["requested_bitrate_kbps"] = state.bitrate_kbps ? nlohmann::json(*state.bitrate_kbps) : nlohmann::json(nullptr);
+    output["encoder_bitrate_kbps"] = state.bitrate_kbps ? nlohmann::json(*state.bitrate_kbps) : nlohmann::json(nullptr);
+    output["codec"] = state.codec ? nlohmann::json(stream::canonical_codec_name(*state.codec)) : nlohmann::json(nullptr);
     output["hdr"] = state.hdr ? nlohmann::json(*state.hdr) : nlohmann::json(nullptr);
+    output["yuv444"] = state.yuv444 ? nlohmann::json(*state.yuv444) : nlohmann::json(false);
+    output["stream_gpu_model"] = state.stream_gpu_model ? nlohmann::json(*state.stream_gpu_model) : nlohmann::json(nullptr);
     output["audio_channels"] = state.audio_channels ? nlohmann::json(*state.audio_channels) : nlohmann::json(nullptr);
     output["audio_codec"] = state.audio_codec ? nlohmann::json(*state.audio_codec) : nlohmann::json(nullptr);
     output["profile"] = state.profile ? nlohmann::json(*state.profile) : nlohmann::json(nullptr);
@@ -494,6 +534,9 @@ namespace confighttp {
     output["video_max_frame_age_ms"] = state.video_max_frame_age_ms ? nlohmann::json(*state.video_max_frame_age_ms) : nlohmann::json(nullptr);
     output["last_audio_bytes"] = state.last_audio_bytes;
     output["last_video_bytes"] = state.last_video_bytes;
+    output["video_bytes_total"] = state.video_bytes_total;
+    output["audio_bytes_total"] = state.audio_bytes_total;
+    output["bytes_sent"] = state.video_bytes_total + state.audio_bytes_total;
     output["last_video_idr"] = state.last_video_idr;
     output["last_video_frame_index"] = state.last_video_frame_index;
 
@@ -507,6 +550,201 @@ namespace confighttp {
 
     output["last_audio_age_ms"] = age_or_null(state.last_audio_time);
     output["last_video_age_ms"] = age_or_null(state.last_video_time);
+    return output;
+  }
+
+  double round_to(double value, double factor) {
+    return std::round(value * factor) / factor;
+  }
+
+  nlohmann::json rtsp_session_to_json(const stream::session_info_t &info) {
+    nlohmann::json output;
+    output["uuid"] = info.uuid;
+    output["device_name"] = info.device_name;
+    output["width"] = info.width;
+    output["height"] = info.height;
+    output["fps"] = info.fps;
+    output["encoder_bitrate_kbps"] = info.encoder_bitrate_kbps;
+    output["requested_bitrate_kbps"] = info.requested_bitrate_kbps;
+    output["video_format"] = info.video_format;
+    output["codec"] = stream::canonical_codec_name(stream::video_format_name(info.video_format));
+    output["hdr"] = info.dynamic_range != 0;
+    output["yuv444"] = info.yuv444;
+    output["audio_channels"] = info.audio_channels;
+    output["stream_gpu_model"] = info.stream_gpu_model;
+    output["state"] = info.state;
+    output["frames_sent"] = info.frames_sent;
+    output["packets_sent"] = info.packets_sent;
+    output["bytes_sent"] = info.bytes_sent;
+    output["idr_requests"] = info.idr_requests;
+    output["invalidate_ref_count"] = info.invalidate_ref_count;
+    output["client_reported_losses"] = info.client_reported_losses;
+    output["encode_latency_ms"] = round_to(info.encode_latency_ms, 10.0);
+    output["last_frame_index"] = info.last_frame_index;
+    output["uptime_seconds"] = round_to(info.uptime_seconds, 10.0);
+    return output;
+  }
+
+  nlohmann::json host_stats_to_json(const platf::host_stats_t &stats) {
+    nlohmann::json output;
+    output["cpu_percent"] = stats.cpu_percent;
+    output["cpu_temp_c"] = stats.cpu_temp_c;
+    output["ram_used_bytes"] = stats.ram_used_bytes;
+    output["ram_total_bytes"] = stats.ram_total_bytes;
+    output["ram_percent"] = stats.ram_total_bytes > 0
+                              ? (static_cast<double>(stats.ram_used_bytes) * 100.0 /
+                                 static_cast<double>(stats.ram_total_bytes))
+                              : 0.0;
+    output["gpu_percent"] = stats.gpu_percent;
+    output["gpu_encoder_percent"] = stats.gpu_encoder_percent;
+    output["gpu_temp_c"] = stats.gpu_temp_c;
+    const auto vram_used_bytes =
+      stats.vram_total_bytes > 0 && stats.vram_used_bytes > stats.vram_total_bytes ?
+        stats.vram_total_bytes :
+        stats.vram_used_bytes;
+    output["vram_used_bytes"] = vram_used_bytes;
+    output["vram_total_bytes"] = stats.vram_total_bytes;
+    output["vram_percent"] = stats.vram_total_bytes > 0
+                               ? (static_cast<double>(vram_used_bytes) * 100.0 /
+                                  static_cast<double>(stats.vram_total_bytes))
+                               : 0.0;
+    output["net_rx_bps"] = stats.net_rx_bps;
+    output["net_tx_bps"] = stats.net_tx_bps;
+    return output;
+  }
+
+  nlohmann::json host_info_to_json(const platf::host_info_t &info) {
+    nlohmann::json output;
+    output["cpu_model"] = info.cpu_model;
+    output["gpu_model"] = info.gpu_model;
+    output["cpu_logical_cores"] = info.cpu_logical_cores;
+    output["ram_total_bytes"] = info.ram_total_bytes;
+    output["vram_total_bytes"] = info.vram_total_bytes;
+    output["net_interface"] = info.net_interface;
+    output["net_link_speed_mbps"] = info.net_link_speed_mbps;
+    return output;
+  }
+
+  nlohmann::json session_summary_to_json(const session_history::session_summary_t &summary) {
+    nlohmann::json output;
+    output["uuid"] = summary.uuid;
+    output["protocol"] = summary.protocol;
+    output["client_name"] = summary.client_name;
+    output["device_name"] = summary.device_name;
+    output["app_name"] = summary.app_name;
+    output["width"] = summary.width;
+    output["height"] = summary.height;
+    output["target_fps"] = summary.target_fps;
+    output["encoder_bitrate_kbps"] = summary.encoder_bitrate_kbps;
+    output["requested_bitrate_kbps"] = summary.requested_bitrate_kbps;
+    output["codec"] = summary.codec;
+    output["hdr"] = summary.hdr;
+    output["yuv444"] = summary.yuv444;
+    output["audio_channels"] = summary.audio_channels;
+    output["start_time_unix"] = summary.start_time_unix;
+    output["end_time_unix"] = summary.end_time_unix;
+    output["duration_seconds"] = round_to(summary.duration_seconds, 10.0);
+    output["verdict"] = summary.verdict;
+    output["server_version"] = summary.server_version;
+    output["host_cpu_model"] = summary.host_cpu_model;
+    output["host_gpu_model"] = summary.host_gpu_model;
+    output["stream_gpu_model"] = summary.stream_gpu_model;
+    return output;
+  }
+
+  nlohmann::json session_sample_to_json(const session_history::session_sample_t &sample) {
+    nlohmann::json output;
+    output["session_uuid"] = sample.session_uuid;
+    output["timestamp_unix"] = sample.timestamp_unix;
+    output["bytes_sent_total"] = sample.bytes_sent_total;
+    output["packets_sent_video"] = sample.packets_sent_video;
+    output["frames_sent"] = sample.frames_sent;
+    output["last_frame_index"] = sample.last_frame_index;
+    output["video_dropped"] = sample.video_dropped;
+    output["audio_dropped"] = sample.audio_dropped;
+    output["client_reported_losses"] = sample.client_reported_losses;
+    output["idr_requests"] = sample.idr_requests;
+    output["ref_invalidations"] = sample.ref_invalidations;
+    output["encode_latency_ms"] = round_to(sample.encode_latency_ms, 10.0);
+    output["actual_fps"] = round_to(sample.actual_fps, 10.0);
+    output["actual_bitrate_kbps"] = round_to(sample.actual_bitrate_kbps, 10.0);
+    output["frame_interval_jitter_ms"] = round_to(sample.frame_interval_jitter_ms, 100.0);
+    output["host_cpu_percent"] = sample.host_cpu_percent < 0 ? -1 : round_to(sample.host_cpu_percent, 10.0);
+    output["host_gpu_percent"] = sample.host_gpu_percent < 0 ? -1 : round_to(sample.host_gpu_percent, 10.0);
+    output["host_gpu_encoder_percent"] = sample.host_gpu_encoder_percent < 0 ? -1 : round_to(sample.host_gpu_encoder_percent, 10.0);
+    output["host_ram_percent"] = sample.host_ram_percent < 0 ? -1 : round_to(sample.host_ram_percent, 10.0);
+    output["host_vram_percent"] = sample.host_vram_percent < 0 ? -1 : round_to(sample.host_vram_percent, 10.0);
+    output["host_cpu_temp_c"] = sample.host_cpu_temp_c < 0 ? -1 : round_to(sample.host_cpu_temp_c, 10.0);
+    output["host_gpu_temp_c"] = sample.host_gpu_temp_c < 0 ? -1 : round_to(sample.host_gpu_temp_c, 10.0);
+    output["host_net_rx_bps"] = sample.host_net_rx_bps < 0 ? -1 : sample.host_net_rx_bps;
+    output["host_net_tx_bps"] = sample.host_net_tx_bps < 0 ? -1 : sample.host_net_tx_bps;
+    return output;
+  }
+
+  nlohmann::json session_event_to_json(const session_history::session_event_t &event) {
+    nlohmann::json output;
+    output["session_uuid"] = event.session_uuid;
+    output["timestamp_unix"] = event.timestamp_unix;
+    output["event_type"] = event.event_type;
+    output["payload"] = event.payload;
+    return output;
+  }
+
+  nlohmann::json active_session_to_json(const session_history::active_session_t &session) {
+    nlohmann::json output;
+    output["uuid"] = session.uuid;
+    output["protocol"] = session.protocol;
+    output["client_name"] = session.client_name;
+    output["device_name"] = session.device_name;
+    output["app_name"] = session.app_name;
+    output["width"] = session.width;
+    output["height"] = session.height;
+    output["target_fps"] = session.target_fps;
+    output["encoder_bitrate_kbps"] = session.encoder_bitrate_kbps;
+    output["requested_bitrate_kbps"] = session.requested_bitrate_kbps;
+    output["codec"] = session.codec;
+    output["hdr"] = session.hdr;
+    output["yuv444"] = session.yuv444;
+    output["stream_gpu_model"] = session.stream_gpu_model;
+    output["uptime_seconds"] = round_to(session.uptime_seconds, 10.0);
+    output["actual_fps"] = round_to(session.actual_fps, 10.0);
+    output["actual_bitrate_kbps"] = round_to(session.actual_bitrate_kbps, 10.0);
+    output["encode_latency_ms"] = round_to(session.encode_latency_ms, 10.0);
+    output["frame_interval_jitter_ms"] = round_to(session.frame_interval_jitter_ms, 100.0);
+    output["frames_sent"] = session.frames_sent;
+    output["bytes_sent"] = session.bytes_sent;
+    output["client_reported_losses"] = session.client_reported_losses;
+    output["idr_requests"] = session.idr_requests;
+    return output;
+  }
+
+  nlohmann::json session_detail_to_json(const session_history::session_detail_t &detail) {
+    nlohmann::json output = session_summary_to_json(detail.summary);
+    output["total_samples"] = detail.total_samples;
+    output["total_events"] = detail.total_events;
+    output["samples_truncated"] = detail.samples_truncated;
+    output["events_truncated"] = detail.events_truncated;
+    output["samples"] = nlohmann::json::array();
+    for (const auto &sample : detail.samples) {
+      output["samples"].push_back(session_sample_to_json(sample));
+    }
+    output["events"] = nlohmann::json::array();
+    for (const auto &event : detail.events) {
+      output["events"].push_back(session_event_to_json(event));
+    }
+    return output;
+  }
+
+  nlohmann::json history_status_to_json(const session_history::history_status_t &status) {
+    nlohmann::json output;
+    output["available"] = status.available;
+    output["degraded"] = status.degraded;
+    output["dropped_samples"] = status.dropped_samples;
+    output["failed_writes"] = status.failed_writes;
+    output["pending_control_commands"] = status.pending_control_commands;
+    output["pending_priority_commands"] = status.pending_priority_commands;
+    output["pending_regular_commands"] = status.pending_regular_commands;
+    output["pending_samples"] = status.pending_samples;
     return output;
   }
 
@@ -826,6 +1064,26 @@ namespace confighttp {
     add_cors_headers(headers);
     nlohmann::json error = {{"error", error_message}};
     response->write(SimpleWeb::StatusCode::server_error_service_unavailable, error.dump(), headers);
+  }
+
+  void conflict(resp_https_t response, const std::string &error_message) {
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "application/json; charset=utf-8");
+    headers.emplace("X-Frame-Options", "DENY");
+    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    add_cors_headers(headers);
+    nlohmann::json error = {{"error", error_message}};
+    response->write(SimpleWeb::StatusCode::client_error_conflict, error.dump(), headers);
+  }
+
+  void gateway_timeout(resp_https_t response, const std::string &error_message) {
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "application/json; charset=utf-8");
+    headers.emplace("X-Frame-Options", "DENY");
+    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    add_cors_headers(headers);
+    nlohmann::json error = {{"error", error_message}};
+    response->write(SimpleWeb::StatusCode::server_error_gateway_timeout, error.dump(), headers);
   }
 
   /**
@@ -2207,7 +2465,9 @@ namespace confighttp {
       std::stringstream config_stream;
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss);
+      std::set<std::string> changed_keys;
       for (const auto &[k, v] : input_tree.items()) {
+        changed_keys.insert(k);
         if (v.is_null() || (v.is_string() && v.get<std::string>().empty())) {
           continue;
         }
@@ -2227,7 +2487,7 @@ namespace confighttp {
         "cert"
       };
       bool restart_required = false;
-      for (const auto &[k, _] : input_tree.items()) {
+      for (const auto &k : changed_keys) {
         if (restart_required_keys.count(k)) {
           restart_required = true;
           break;
@@ -2238,7 +2498,7 @@ namespace confighttp {
       bool deferred = false;
 
       if (!restart_required) {
-        if (rtsp_stream::session_count() == 0) {
+        if (can_hot_apply_during_session(changed_keys) || !has_active_stream_sessions()) {
           // Apply immediately
           config::apply_config_now();
           applied_now = true;
@@ -2341,16 +2601,7 @@ namespace confighttp {
       bool applied_now = false;
       bool deferred = false;
       if (!restart_required) {
-        // Determine if only Playnite-related keys were changed; these are safe to hot-apply
-        // even when a streaming session is active.
-        bool only_playnite = !changed_keys.empty();
-        for (const auto &k : changed_keys) {
-          if (k.rfind("playnite_", 0) != 0) {
-            only_playnite = false;
-            break;
-          }
-        }
-        if (only_playnite || rtsp_stream::session_count() == 0) {
+        if (can_hot_apply_during_session(changed_keys) || !has_active_stream_sessions()) {
           // Apply immediately
           config::apply_config_now();
           applied_now = true;
@@ -2384,9 +2635,44 @@ namespace confighttp {
     const bool app_running = proc::proc.running() > 0;
     output_tree["activeSessions"] = active;
     output_tree["appRunning"] = app_running;
+    output_tree["appName"] = app_running ? proc::proc.get_last_run_app_name() : "";
     output_tree["paused"] = app_running && active == 0;
     output_tree["status"] = true;
     send_response(response, output_tree);
+  }
+
+  // Live host system performance counters (CPU/GPU/RAM/VRAM/temps).
+  void getHostStats(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+
+    send_response(response, host_stats_to_json(host_stats::latest()));
+  }
+
+  // Static host info — model strings + total RAM/VRAM, sampled once.
+  void getHostInfo(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    print_req(request);
+
+    send_response(response, host_info_to_json(host_stats::info()));
+  }
+
+
+  void listRTSPSessions(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    nlohmann::json output;
+    output["sessions"] = nlohmann::json::array();
+    for (const auto &info : stream::get_all_session_info()) {
+      output["sessions"].push_back(rtsp_session_to_json(info));
+    }
+    send_response(response, output);
   }
 
   void listWebRTCSessions(resp_https_t response, req_https_t request) {
@@ -2398,6 +2684,108 @@ namespace confighttp {
     output["sessions"] = nlohmann::json::array();
     for (const auto &session : webrtc_stream::list_sessions()) {
       output["sessions"].push_back(webrtc_session_to_json(session));
+    }
+    send_response(response, output);
+  }
+
+  // ── Session History endpoints ────────────────────────────────────
+
+  void listSessionHistory(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    int limit = 25;
+    int offset = 0;
+    auto query = request->parse_query_string();
+    auto it_limit = query.find("limit");
+    if (it_limit != query.end()) {
+      try { limit = std::stoi(it_limit->second); } catch (...) {}
+    }
+    auto it_offset = query.find("offset");
+    if (it_offset != query.end()) {
+      try { offset = std::stoi(it_offset->second); } catch (...) {}
+    }
+    limit = std::clamp(limit, 1, 100);
+    offset = std::max(offset, 0);
+
+    nlohmann::json output;
+    output["sessions"] = nlohmann::json::array();
+    for (const auto &s : session_history::list_sessions(limit, offset)) {
+      output["sessions"].push_back(session_summary_to_json(s));
+    }
+    output["history_status"] = history_status_to_json(session_history::get_history_status());
+    send_response(response, output);
+  }
+
+  void getSessionHistoryDetail(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    auto uuid = request->path_match[1].str();
+    const auto query = request->parse_query_string();
+    const bool include_all = [&query]() {
+      auto it = query.find("full");
+      if (it == query.end()) {
+        return false;
+      }
+      return it->second == "1" || it->second == "true" || it->second == "yes";
+    }();
+
+    auto detail = session_history::get_session_detail(uuid, include_all);
+    if (!detail) {
+      not_found(response, request);
+      return;
+    }
+
+    auto output = session_detail_to_json(*detail);
+    output["history_status"] = history_status_to_json(session_history::get_history_status());
+    send_response(response, output);
+  }
+
+  void deleteSessionHistory(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    auto uuid = request->path_match[1].str();
+    auto result = session_history::delete_session(uuid);
+    switch (result) {
+      case session_history::delete_result_e::deleted:
+        break;
+      case session_history::delete_result_e::not_found:
+        not_found(response, request);
+        return;
+      case session_history::delete_result_e::active_session:
+        conflict(response, "Cannot delete an active session");
+        return;
+      case session_history::delete_result_e::unavailable:
+        service_unavailable(response, "Session history subsystem unavailable");
+        return;
+      case session_history::delete_result_e::timeout:
+        gateway_timeout(response, "Timed out waiting for session history delete");
+        return;
+      case session_history::delete_result_e::failed:
+        service_unavailable(response, "Session history delete failed");
+        return;
+    }
+
+    nlohmann::json output;
+    output["status"] = "ok";
+    output["uuid"] = uuid;
+    send_response(response, output);
+  }
+
+  void getActiveSessionHistory(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    nlohmann::json output;
+    output["sessions"] = nlohmann::json::array();
+    for (const auto &as : session_history::get_active_sessions()) {
+      output["sessions"].push_back(active_session_to_json(as));
     }
     send_response(response, output);
   }
@@ -3196,8 +3584,14 @@ namespace confighttp {
           if (newPassword.empty() || newPassword != confirmPassword) {
             errors.push_back("Password Mismatch");
           } else {
-            http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword);
-            http::reload_user_creds(config::sunshine.credentials_file);
+            if (http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword)) {
+              service_unavailable(response, "Unable to write credentials file");
+              return;
+            }
+            if (http::reload_user_creds(config::sunshine.credentials_file)) {
+              service_unavailable(response, "Unable to reload credentials file");
+              return;
+            }
             sessionCookie.clear();  // force re-login
             output_tree["status"] = true;
           }
@@ -3398,6 +3792,102 @@ namespace confighttp {
 
   constexpr int kGoldenSnapshotLatestVersion = 2;
 
+  struct golden_current_mode_t {
+    unsigned int width {};
+    unsigned int height {};
+    double refresh_hz {};
+  };
+
+  struct golden_current_summary_t {
+    bool valid {false};
+    bool active_virtual_display {false};
+    std::set<std::string> devices;
+    std::unordered_map<std::string, golden_current_mode_t> modes;
+    std::unordered_map<std::string, bool> hdr;
+    std::unordered_map<std::string, std::pair<int, int>> origins;
+    std::string primary;
+  };
+
+  static std::string normalized_display_id(std::string id) {
+    id.erase(id.begin(), std::find_if(id.begin(), id.end(), [](unsigned char ch) {
+               return !std::isspace(ch);
+             }));
+    id.erase(std::find_if(id.rbegin(), id.rend(), [](unsigned char ch) {
+               return !std::isspace(ch);
+             }).base(),
+             id.end());
+    std::transform(id.begin(), id.end(), id.begin(), [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
+    return id;
+  }
+
+  static bool contains_ci(const std::string &haystack, const std::string &needle) {
+    if (needle.empty()) {
+      return true;
+    }
+    if (haystack.size() < needle.size()) {
+      return false;
+    }
+    for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+      bool match = true;
+      for (size_t j = 0; j < needle.size(); ++j) {
+        if (std::tolower(static_cast<unsigned char>(haystack[i + j])) !=
+            std::tolower(static_cast<unsigned char>(needle[j]))) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool equals_ci(const std::string &lhs, const std::string &rhs) {
+    return lhs.size() == rhs.size() && contains_ci(lhs, rhs);
+  }
+
+  static bool is_virtual_display_device(const display_device::EnumeratedDevice &device) {
+    if (contains_ci(device.m_device_id, "SUDOVDA") ||
+        contains_ci(device.m_device_id, "SUDOMAKER") ||
+        contains_ci(device.m_display_name, "SUDOVDA") ||
+        contains_ci(device.m_display_name, "SUDOMAKER") ||
+        contains_ci(device.m_friendly_name, "SUDOVDA") ||
+        contains_ci(device.m_friendly_name, "SUDOMAKER")) {
+      return true;
+    }
+    if (equals_ci(device.m_friendly_name, "SudoMaker Virtual Display Adapter")) {
+      return true;
+    }
+    return device.m_edid && equals_ci(device.m_edid->m_manufacturer_id, "SMK");
+  }
+
+  static bool is_active_display_device(const display_device::EnumeratedDevice &device) {
+    return device.m_info.has_value() || !device.m_display_name.empty();
+  }
+
+  static std::optional<double> floating_to_double(const display_device::FloatingPoint &value) {
+    if (std::holds_alternative<double>(value)) {
+      return std::get<double>(value);
+    }
+    const auto &rat = std::get<display_device::Rational>(value);
+    if (rat.m_denominator == 0) {
+      return std::nullopt;
+    }
+    return static_cast<double>(rat.m_numerator) / static_cast<double>(rat.m_denominator);
+  }
+
+  static bool nearly_equal_refresh(double lhs, double rhs) {
+    if (!std::isfinite(lhs) || !std::isfinite(rhs)) {
+      return false;
+    }
+    const double diff = std::abs(lhs - rhs);
+    const double scale = std::max({1.0, std::abs(lhs), std::abs(rhs)});
+    return diff <= scale * 1e-4;
+  }
+
   static std::optional<nlohmann::json> read_json_file_nofail(const std::filesystem::path &path) {
     try {
       std::ifstream file(path, std::ios::binary);
@@ -3447,6 +3937,213 @@ namespace confighttp {
     return false;
   }
 
+  static std::set<std::string> snapshot_topology_devices(const nlohmann::json &root) {
+    std::set<std::string> ids;
+    auto topology = root.find("topology");
+    if (topology != root.end() && topology->is_array()) {
+      for (const auto &group : *topology) {
+        if (!group.is_array()) {
+          continue;
+        }
+        for (const auto &device : group) {
+          if (device.is_string()) {
+            auto id = normalized_display_id(device.get<std::string>());
+            if (!id.empty()) {
+              ids.insert(std::move(id));
+            }
+          }
+        }
+      }
+    }
+    if (ids.empty()) {
+      auto modes = root.find("modes");
+      if (modes != root.end() && modes->is_object()) {
+        for (auto it = modes->begin(); it != modes->end(); ++it) {
+          auto id = normalized_display_id(it.key());
+          if (!id.empty()) {
+            ids.insert(std::move(id));
+          }
+        }
+      }
+    }
+    return ids;
+  }
+
+  static std::unordered_map<std::string, golden_current_mode_t> snapshot_modes(const nlohmann::json &root) {
+    std::unordered_map<std::string, golden_current_mode_t> modes;
+    auto modes_it = root.find("modes");
+    if (modes_it == root.end() || !modes_it->is_object()) {
+      return modes;
+    }
+    for (auto it = modes_it->begin(); it != modes_it->end(); ++it) {
+      if (!it->is_object()) {
+        continue;
+      }
+      auto id = normalized_display_id(it.key());
+      const auto width = it->value("w", 0u);
+      const auto height = it->value("h", 0u);
+      const auto num = it->value("num", 0u);
+      const auto den = it->value("den", 0u);
+      if (id.empty() || width == 0 || height == 0 || den == 0) {
+        continue;
+      }
+      modes.emplace(std::move(id), golden_current_mode_t {
+                                      .width = width,
+                                      .height = height,
+                                      .refresh_hz = static_cast<double>(num) / static_cast<double>(den),
+                                    });
+    }
+    return modes;
+  }
+
+  static std::unordered_map<std::string, bool> snapshot_hdr_states(const nlohmann::json &root) {
+    std::unordered_map<std::string, bool> states;
+    auto hdr_it = root.find("hdr");
+    if (hdr_it == root.end() || !hdr_it->is_object()) {
+      return states;
+    }
+    for (auto it = hdr_it->begin(); it != hdr_it->end(); ++it) {
+      if (!it->is_string()) {
+        continue;
+      }
+      auto id = normalized_display_id(it.key());
+      auto value = boost::algorithm::to_lower_copy(it->get<std::string>());
+      if (id.empty() || (value != "on" && value != "off")) {
+        continue;
+      }
+      states.emplace(std::move(id), value == "on");
+    }
+    return states;
+  }
+
+  static std::unordered_map<std::string, std::pair<int, int>> snapshot_origins(const nlohmann::json &root) {
+    std::unordered_map<std::string, std::pair<int, int>> origins;
+    auto origins_it = root.find("origins");
+    if (origins_it == root.end() || !origins_it->is_object()) {
+      return origins;
+    }
+    for (auto it = origins_it->begin(); it != origins_it->end(); ++it) {
+      if (!it->is_object()) {
+        continue;
+      }
+      auto id = normalized_display_id(it.key());
+      if (id.empty()) {
+        continue;
+      }
+      origins.emplace(std::move(id), std::make_pair(it->value("x", 0), it->value("y", 0)));
+    }
+    return origins;
+  }
+
+  static golden_current_summary_t current_golden_comparison_summary() {
+    golden_current_summary_t summary;
+    const auto devices = display_helper_integration::enumerate_devices(display_device::DeviceEnumerationDetail::Full);
+    if (!devices) {
+      return summary;
+    }
+
+    std::set<std::string> exclusions;
+    for (auto id : config::video.dd.snapshot_exclude_devices) {
+      id = normalized_display_id(std::move(id));
+      if (!id.empty()) {
+        exclusions.insert(std::move(id));
+      }
+    }
+
+    for (const auto &device : *devices) {
+      if (is_virtual_display_device(device)) {
+        if (is_active_display_device(device)) {
+          summary.active_virtual_display = true;
+        }
+        continue;
+      }
+      if (!device.m_info || device.m_display_name.empty()) {
+        continue;
+      }
+
+      auto id = normalized_display_id(device.m_device_id.empty() ? device.m_display_name : device.m_device_id);
+      if (id.empty() || exclusions.contains(id)) {
+        continue;
+      }
+
+      summary.devices.insert(id);
+      if (auto refresh = floating_to_double(device.m_info->m_refresh_rate)) {
+        summary.modes[id] = golden_current_mode_t {
+          .width = device.m_info->m_resolution.m_width,
+          .height = device.m_info->m_resolution.m_height,
+          .refresh_hz = *refresh,
+        };
+      }
+      if (device.m_info->m_hdr_state) {
+        summary.hdr[id] = *device.m_info->m_hdr_state == display_device::HdrState::Enabled;
+      }
+      summary.origins[id] = std::make_pair(device.m_info->m_origin_point.m_x, device.m_info->m_origin_point.m_y);
+      if (device.m_info->m_primary) {
+        summary.primary = id;
+      }
+    }
+
+    summary.valid = !summary.devices.empty();
+    return summary;
+  }
+
+  static std::optional<std::string> snapshot_current_mismatch_reason(const nlohmann::json &root) {
+    const auto current = current_golden_comparison_summary();
+    if (current.active_virtual_display) {
+      return std::nullopt;
+    }
+    if (!current.valid) {
+      return std::nullopt;
+    }
+
+    const auto snapshot_devices = snapshot_topology_devices(root);
+    if (snapshot_devices.empty()) {
+      return "invalid_snapshot";
+    }
+    if (snapshot_devices != current.devices) {
+      return "display_set_changed";
+    }
+
+    const auto modes = snapshot_modes(root);
+    for (const auto &[id, mode] : modes) {
+      auto current_mode = current.modes.find(id);
+      if (current_mode == current.modes.end()) {
+        continue;
+      }
+      if (mode.width != current_mode->second.width ||
+          mode.height != current_mode->second.height ||
+          !nearly_equal_refresh(mode.refresh_hz, current_mode->second.refresh_hz)) {
+        return "display_mode_changed";
+      }
+    }
+
+    const auto hdr_states = snapshot_hdr_states(root);
+    for (const auto &[id, hdr] : hdr_states) {
+      auto current_hdr = current.hdr.find(id);
+      if (current_hdr != current.hdr.end() && hdr != current_hdr->second) {
+        return "hdr_changed";
+      }
+    }
+
+    auto primary_it = root.find("primary");
+    if (primary_it != root.end() && primary_it->is_string()) {
+      const auto primary = normalized_display_id(primary_it->get<std::string>());
+      if (!primary.empty() && !current.primary.empty() && primary != current.primary) {
+        return "primary_changed";
+      }
+    }
+
+    const auto origins = snapshot_origins(root);
+    for (const auto &[id, origin] : origins) {
+      auto current_origin = current.origins.find(id);
+      if (current_origin != current.origins.end() && origin != current_origin->second) {
+        return "layout_changed";
+      }
+    }
+
+    return "";
+  }
+
   void getGoldenStatus(resp_https_t response, req_https_t request) {
     if (!authenticate(response, request)) {
       return;
@@ -3457,6 +4154,9 @@ namespace confighttp {
     std::optional<int> snapshot_version;
     bool has_layout = false;
     bool needs_layout_upgrade = false;
+    bool out_of_date = false;
+    bool comparison_available = false;
+    std::string out_of_date_reason;
     try {
       for (const auto &p : golden_snapshot_candidates()) {
         if (file_exists_nofail(p)) {
@@ -3466,8 +4166,23 @@ namespace confighttp {
             has_layout = snapshot_has_layout_data(*root);
             const bool latest_schema = snapshot_version && *snapshot_version >= kGoldenSnapshotLatestVersion;
             needs_layout_upgrade = !latest_schema || !has_layout;
+            out_of_date = needs_layout_upgrade;
+            if (needs_layout_upgrade) {
+              out_of_date_reason = "schema_upgrade_required";
+            }
+            if (!has_active_stream_sessions()) {
+              if (auto mismatch = snapshot_current_mismatch_reason(*root)) {
+                comparison_available = true;
+                if (!mismatch->empty()) {
+                  out_of_date = true;
+                  out_of_date_reason = *mismatch;
+                }
+              }
+            }
           } else {
             needs_layout_upgrade = true;
+            out_of_date = true;
+            out_of_date_reason = "unreadable_snapshot";
           }
           break;
         }
@@ -3479,6 +4194,9 @@ namespace confighttp {
     out["latest_snapshot_version"] = kGoldenSnapshotLatestVersion;
     out["has_layout"] = has_layout;
     out["needs_layout_upgrade"] = needs_layout_upgrade;
+    out["out_of_date"] = out_of_date;
+    out["comparison_available"] = comparison_available;
+    out["out_of_date_reason"] = out_of_date_reason;
     send_response(response, out);
   }
 
@@ -3886,7 +4604,14 @@ namespace confighttp {
     register_api_route("^/api/clients/disconnect$", "POST", disconnectClient);
     register_api_route("^/api/apps/close$", "POST", closeApp);
     register_api_route("^/api/session/status$", "GET", getSessionStatus);
+    register_api_route("^/api/host/stats$", "GET", getHostStats);
+    register_api_route("^/api/host/info$", "GET", getHostInfo);
+    register_api_route("^/api/rtsp/sessions$", "GET", listRTSPSessions);
     register_api_route("^/api/webrtc/sessions$", "GET", listWebRTCSessions);
+    register_api_route("^/api/history/sessions$", "GET", listSessionHistory);
+    register_api_route("^/api/history/sessions/active$", "GET", getActiveSessionHistory);
+    register_api_route("^/api/history/sessions/([A-Fa-f0-9-]+)$", "GET", getSessionHistoryDetail);
+    register_api_route("^/api/history/sessions/([A-Fa-f0-9-]+)$", "DELETE", deleteSessionHistory);
     register_api_route("^/api/webrtc/sessions$", "POST", createWebRTCSession);
     register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)$", "GET", getWebRTCSession);
     register_api_route("^/api/webrtc/sessions/([A-Fa-f0-9-]+)$", "DELETE", deleteWebRTCSession);
@@ -3931,7 +4656,7 @@ namespace confighttp {
     register_api_route("^/api/auth/sessions$", "GET", listSessions);
     register_api_route("^/api/auth/sessions/([A-Fa-f0-9]+)$", "DELETE", revokeSession);
     server.config.reuse_address = true;
-    server.config.address = net::af_to_any_address_string(address_family);
+    server.config.address = net::get_bind_address(address_family);
     server.config.port = port_https;
 
     auto accept_and_run = [&](auto *server) {

@@ -20,3 +20,5 @@ jobs:
     with:
       release_commit: ${{ github.sha }}
       release_version: 0.0.0
+      symbol_product_name: Vibepollo
+      symbol_release_prefix: polo

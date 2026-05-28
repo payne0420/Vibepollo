@@ -2215,6 +2215,10 @@ namespace {
     // Track whether a revert/restore is currently pending
     std::atomic<bool> restore_requested {false};
     std::atomic<uint64_t> restore_cancel_generation {0};
+    // True after the restore loop has made at least one restore attempt that has
+    // not yet been confirmed. DISARM/SNAPSHOT_CURRENT from a later stream-start
+    // probe must not cancel or overwrite that restore baseline.
+    std::atomic<bool> restore_attempted_unconfirmed {false};
     // Guard: if a session restore succeeded recently, suppress Golden for a cooldown
     std::atomic<long long> last_session_restore_success_ms {0};
     // After a few consecutive confirmed session fallbacks, stop forcing golden
@@ -2223,7 +2227,7 @@ namespace {
     // When true, prefer golden snapshot over session snapshots during restore (reduces stuck virtual screens)
     std::atomic<bool> always_restore_from_golden {false};
     // When true, prefer golden over previous only when current is unavailable.
-    std::atomic<bool> prefer_golden_if_current_missing {false};
+    std::atomic<bool> prefer_golden_if_current_missing {true};
 
     // Polling-based restore loop state (replaces topology-change-triggered retries)
     std::jthread restore_poll_thread;
@@ -3146,6 +3150,8 @@ namespace {
         return false;
       }
 
+      restore_attempted_unconfirmed.store(true, std::memory_order_release);
+
       const bool golden_first = always_restore_from_golden.load(std::memory_order_acquire);
       if (!golden_first) {
         reset_pending_golden_session_fallbacks();
@@ -3196,9 +3202,9 @@ namespace {
           return true;
         }
 
-        const bool current_snapshot_missing = !path_exists(session_current_path);
+        const bool current_snapshot_unavailable = !attempted_current;
         const bool prefer_golden_before_previous =
-          prefer_golden_if_current_missing.load(std::memory_order_acquire) && current_snapshot_missing;
+          prefer_golden_if_current_missing.load(std::memory_order_acquire) && current_snapshot_unavailable;
         if (prefer_golden_before_previous) {
           std::error_code ec_prev, ec_golden;
           const bool has_previous = std::filesystem::exists(session_previous_path, ec_prev) && !ec_prev;
@@ -3324,6 +3330,7 @@ namespace {
       request_restore_cancel();
       event_pump.stop();
       event_pump_running.store(false, std::memory_order_release);
+      restore_attempted_unconfirmed.store(false, std::memory_order_release);
       reset_restore_backoff();
       restore_active_until_ms.store(0, std::memory_order_release);
       last_restore_event_ms.store(0, std::memory_order_release);
@@ -3332,7 +3339,7 @@ namespace {
       stop_and_join(restore_poll_thread, "restore-poll");
       restore_requested.store(false, std::memory_order_release);
       restore_origin_epoch.store(0, std::memory_order_release);
-      prefer_golden_if_current_missing.store(false, std::memory_order_release);
+      prefer_golden_if_current_missing.store(true, std::memory_order_release);
       reset_pending_golden_session_fallbacks();
     }
 
@@ -3369,7 +3376,8 @@ namespace {
 
     void clear_restore_origin() {
       restore_origin_epoch.store(0, std::memory_order_release);
-      prefer_golden_if_current_missing.store(false, std::memory_order_release);
+      prefer_golden_if_current_missing.store(true, std::memory_order_release);
+      restore_attempted_unconfirmed.store(false, std::memory_order_release);
       reset_pending_golden_session_fallbacks();
     }
 
@@ -4537,23 +4545,36 @@ namespace {
     }
   }
 
-  bool parse_revert_prefer_golden_payload(std::span<const uint8_t> payload) {
+  struct RevertOptions {
+    bool prefer_golden_if_current_missing {true};
+    std::optional<bool> always_restore_from_golden;
+  };
+
+  RevertOptions parse_revert_payload(std::span<const uint8_t> payload) {
+    RevertOptions options;
     if (payload.empty()) {
-      return false;
+      return options;
     }
 
     try {
       std::string raw(reinterpret_cast<const char *>(payload.data()), payload.size());
       auto j = nlohmann::json::parse(raw, nullptr, false);
       if (!j.is_object()) {
-        return false;
+        return options;
       }
 
       auto it = j.find("sunshine_prefer_golden_if_current_missing");
-      return it != j.end() && it->is_boolean() && it->get<bool>();
+      if (it != j.end() && it->is_boolean()) {
+        options.prefer_golden_if_current_missing = it->get<bool>();
+      }
+
+      it = j.find("sunshine_always_restore_from_golden");
+      if (it != j.end() && it->is_boolean()) {
+        options.always_restore_from_golden = it->get<bool>();
+      }
     } catch (...) {
-      return false;
     }
+    return options;
   }
 
   /**
@@ -4745,10 +4766,10 @@ namespace {
       constexpr int kMaxSyncVerifyAttempts = 2;
       bool verified_sync = false;
       std::vector<std::chrono::milliseconds> reapply_delays {750ms};
-      if (cfg.m_hdr_state && *cfg.m_hdr_state == display_device::HdrState::Enabled) {
-        // HDR state can be (re)applied asynchronously by Windows shortly after topology/mode changes,
+      if (cfg.m_hdr_state) {
+        // HDR state can be changed asynchronously by Windows shortly after topology/mode changes,
         // especially for virtual displays. Schedule a few extra best-effort re-apply attempts to
-        // enforce the requested HDR state.
+        // enforce either HDR enablement or the SDR request's HDR disablement.
         reapply_delays = {750ms, 2500ms, 5500ms};
       }
 
@@ -4791,16 +4812,19 @@ namespace {
   }
 
   void handle_revert(ServiceState &state, std::atomic<bool> &running, std::span<const uint8_t> payload) {
-    const bool prefer_golden_if_current_missing = parse_revert_prefer_golden_payload(payload);
+    const auto revert_options = parse_revert_payload(payload);
     BOOST_LOG(info) << "REVERT command received - initiating display settings restoration"
-                    << (prefer_golden_if_current_missing ? " (prefer golden if current missing)." : ".");
+                    << (revert_options.prefer_golden_if_current_missing ? " (prefer golden if current missing)." : ".");
     state.retry_apply_on_topology.store(false, std::memory_order_release);
     state.cancel_delayed_reapply();
     state.cancel_post_apply_tasks();
     state.direct_revert_bypass_grace.store(true, std::memory_order_release);
     state.exit_after_revert.store(true, std::memory_order_release);
     state.restore_requested.store(true, std::memory_order_release);
-    state.prefer_golden_if_current_missing.store(prefer_golden_if_current_missing, std::memory_order_release);
+    if (revert_options.always_restore_from_golden.has_value()) {
+      state.always_restore_from_golden.store(*revert_options.always_restore_from_golden, std::memory_order_release);
+    }
+    state.prefer_golden_if_current_missing.store(revert_options.prefer_golden_if_current_missing, std::memory_order_release);
     state.restore_origin_epoch.store(state.current_connection_epoch(), std::memory_order_release);
 
     // Give Sunshine a short window to immediately start a new session and DISARM,
@@ -4821,8 +4845,17 @@ namespace {
       state.retry_apply_on_topology.store(false, std::memory_order_release);
       state.retry_revert_on_topology.store(false, std::memory_order_release);
     } else if (type == MsgType::Disarm) {
+      if (state.restore_requested.load(std::memory_order_acquire) &&
+          state.restore_attempted_unconfirmed.load(std::memory_order_acquire)) {
+        BOOST_LOG(info) << "DISARM command ignored because an unconfirmed restore attempt is still pending.";
+        return;
+      }
       state.disarm_restore_requests("DISARM command received");
     } else if (type == MsgType::SnapshotCurrent) {
+      if (state.restore_requested.load(std::memory_order_acquire)) {
+        BOOST_LOG(info) << "Skipping current session snapshot refresh while restore is pending.";
+        return;
+      }
       (void) state.refresh_current_snapshot_preserving_previous("snapshot-only");
     } else if (type == MsgType::Ping) {
       state.record_heartbeat_ping();
@@ -5131,7 +5164,11 @@ int main(int argc, char *argv[]) {
     }
 
     const auto connection_epoch = state.begin_connection_epoch();
-    state.stop_restore_polling();
+    // Do not cancel restore polling merely because Sunshine connected. Stream start
+    // often opens the helper first for SNAPSHOT_CURRENT/DISARM probes; cancelling
+    // here can strand a prior, unconfirmed restore when a physical monitor is
+    // present but its input is switched away. APPLY/DISARM handlers decide
+    // explicitly whether a restore should be superseded.
     state.begin_heartbeat_monitoring();
 
     // Reset and start per-connection command worker so IPC stays responsive even during heavy display work.

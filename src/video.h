@@ -61,6 +61,11 @@ namespace video {
     // When display_width > 0, use these for display creation; otherwise use width/height.
     int display_width = 0;
     int display_height = 0;
+
+    // Original client-requested wire-bandwidth budget in Kbps, before Sunshine
+    // subtracts FEC/audio/control overhead from `bitrate` for the encoder.
+    // Same as `bitrate` for clients that don't send maximumBitrateKbps.
+    int client_requested_bitrate;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
@@ -278,6 +283,7 @@ namespace video {
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
     // Raw capture/QPC-derived timestamp before pacing adjustments.
     std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
+    std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
   };
 
   struct packet_raw_avcodec: packet_raw_t {

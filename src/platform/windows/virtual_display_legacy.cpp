@@ -5,6 +5,7 @@
 #include <combaseapi.h>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdint>
 #include <cstdio>
 #include <dxgi.h>
 #include <dxgi1_6.h>
@@ -197,7 +198,7 @@ namespace {
     displayArray.clear();
   }
 
-  bool findDisplayIds(const wchar_t *displayName, LUID &adapterId, uint32_t &targetId) {
+  bool findDisplayIds(const wchar_t *displayName, LUID &adapterId, std::uint32_t &targetId) {
     UINT32 pathCount;
     UINT32 modeCount;
     if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount)) {
@@ -322,7 +323,7 @@ namespace {
     return false;
   }
 
-  bool setDisplayHDR(const LUID &adapterId, const uint32_t &targetId, bool enableAdvancedColor) {
+  bool setDisplayHDR(const LUID &adapterId, const std::uint32_t &targetId, bool enableAdvancedColor) {
     DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE setHdrInfo = {};
     setHdrInfo.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
     setHdrInfo.header.size = sizeof(setHdrInfo);
@@ -549,7 +550,7 @@ LONG changeDisplaySettings(const wchar_t *deviceName, int width, int height, int
 
 bool getDisplayHDRByName(const wchar_t *displayName) {
   LUID adapterId;
-  uint32_t targetId;
+  std::uint32_t targetId;
 
   if (!findDisplayIds(displayName, adapterId, targetId)) {
     wprintf(L"[SUDOVDA] Failed to find display IDs for %ls!\n", displayName);
@@ -561,7 +562,7 @@ bool getDisplayHDRByName(const wchar_t *displayName) {
 
 bool setDisplayHDRByName(const wchar_t *displayName, bool enableAdvancedColor) {
   LUID adapterId;
-  uint32_t targetId;
+  std::uint32_t targetId;
 
   if (!findDisplayIds(displayName, adapterId, targetId)) {
     return false;

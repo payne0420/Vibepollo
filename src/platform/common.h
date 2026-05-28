@@ -355,6 +355,8 @@ namespace platf {
     std::int32_t row_pitch {};
 
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
+    std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
+    std::optional<std::chrono::steady_clock::time_point> capture_pacing_timestamp;
 
     virtual ~img_t() = default;
   };
@@ -550,9 +552,14 @@ namespace platf {
 
     /**
      * @brief Resets the default audio device away from virtual streaming speakers.
-     * If no valid device is available, waits for one to appear before giving up.
+     * Implementations may continue trying in the background to restore the
+     * preferred device after moving the default away from virtual speakers.
+     * @param preferred_device Device identifier (platform-specific, e.g. on Windows the
+     *        endpoint device_id) of the device that should be restored as default. If
+     *        empty, implementations fall back to letting the OS pick whatever non-virtual
+     *        device is currently present.
      */
-    virtual void reset_default_device() {}
+    virtual void reset_default_device(const std::string &preferred_device = {}) {}
 
     virtual ~audio_control_t() = default;
   };
@@ -867,5 +874,71 @@ namespace platf {
 
   bool
     set_clipboard(const std::string &content);
+
+  /**
+   * @brief Snapshot of host system performance counters.
+   *
+   * Any field that cannot be sampled on the current platform is left at the
+   * default sentinel (-1.f for percentages/temperatures, 0 for byte counts).
+   */
+  struct host_stats_t {
+    float cpu_percent = -1.f;
+    float cpu_temp_c = -1.f;
+    std::uint64_t ram_used_bytes = 0;
+    std::uint64_t ram_total_bytes = 0;
+    float gpu_percent = -1.f;
+    float gpu_encoder_percent = -1.f;
+    float gpu_temp_c = -1.f;
+    std::uint64_t vram_used_bytes = 0;
+    std::uint64_t vram_total_bytes = 0;
+    // Network throughput on the chosen primary interface, in bits/sec.
+    // -1 means "no measurement yet" (e.g. first sample after start, or
+    // platform without an implementation).
+    double net_rx_bps = -1.0;
+    double net_tx_bps = -1.0;
+  };
+
+  /**
+   * @brief Static information about the host (cached, sampled once at startup).
+   */
+  struct host_info_t {
+    std::string cpu_model;
+    std::string gpu_model;
+    int cpu_logical_cores = 0;
+    std::uint64_t ram_total_bytes = 0;
+    std::uint64_t vram_total_bytes = 0;
+    // Friendly name of the network interface used for throughput sampling
+    // (empty if none was selectable).
+    std::string net_interface;
+    // Reported link speed in Mbps (0 if unknown).
+    std::uint64_t net_link_speed_mbps = 0;
+  };
+
+  /**
+   * @brief Per-platform host stats provider.
+   *
+   * Implementations live in src/platform/<os>/host_stats.cpp and are
+   * instantiated through @ref create_host_stats_provider. The provider is
+   * polled from a single sampler thread owned by @ref host_stats.
+   */
+  class host_stats_provider_t {
+  public:
+    virtual ~host_stats_provider_t() = default;
+
+    /** @brief Sample the current host stats. */
+    virtual host_stats_t sample() = 0;
+
+    /** @brief Return the static host info (called once, may be cached). */
+    virtual host_info_t info() = 0;
+  };
+
+  /**
+   * @brief Factory for the platform-specific host stats provider.
+   *
+   * Always returns a usable provider; on platforms without a real
+   * implementation, it returns a stub that emits empty samples.
+   */
+  std::unique_ptr<host_stats_provider_t>
+    create_host_stats_provider();
 
 }  // namespace platf

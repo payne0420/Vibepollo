@@ -39,9 +39,12 @@
 #include "platform/common.h"
 #include "process.h"
 #include "rtsp.h"
+#include "session_history.h"
 #include "state_storage.h"
 #include "utility.h"
+#include "version_compare.h"
 #include "video.h"
+#include "webrtc_stream.h"
 
 #ifdef _WIN32
   #include "platform/windows/utils.h"
@@ -847,6 +850,7 @@ namespace config {
     APPS_JSON_PATH,
 
     20,  // fecPercentage
+    64,  // video_max_batch_size_kb
 
     ENCRYPTION_MODE_NEVER,  // lan_encryption_mode
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
@@ -912,13 +916,10 @@ namespace config {
   };
 
   namespace {
-    constexpr int default_min_log_level() {
-#ifdef PROJECT_VERSION_PRERELEASE
-      constexpr std::string_view prerelease = PROJECT_VERSION_PRERELEASE;
-      if (!prerelease.empty()) {
+    int default_min_log_level() {
+      if (version_compare::is_prerelease_channel(PROJECT_VERSION)) {
         return 1;
       }
-#endif
       return 2;
     }
   }  // namespace
@@ -939,6 +940,7 @@ namespace config {
     {},  // cmd args
     47989,  // Base port number
     "ipv4",  // Address family
+    {},  // Bind address
     platf::appdata().string() + "/sunshine.log",  // log file
     false,  // notify_pre_releases
     false,  // legacy_ordering
@@ -948,7 +950,10 @@ namespace config {
     {},  // server commands
     std::chrono::hours {2},  // session_token_ttl default 2h
     std::chrono::hours {24 * 7},  // remember_me_refresh_token_ttl default 7d
-    86400  // update_check_interval_seconds default 24h
+    86400,  // update_check_interval_seconds default 24h
+    true,  // session_history_enabled
+    0,  // session_history_ttl_days (disabled by default)
+    0  // session_history_db_size_limit_mb (disabled by default)
   };
 
   namespace {
@@ -1693,6 +1698,7 @@ namespace config {
     list_server_cmd_f(vars, "server_cmd", config::sunshine.server_cmds);
 
     int_f(vars, "update_check_interval", config::sunshine.update_check_interval_seconds);
+    bool_f(vars, "session_history_enabled", config::sunshine.session_history_enabled);
 
     string_f(vars, "audio_sink", audio.sink);
     string_f(vars, "virtual_sink", audio.virtual_sink);
@@ -1718,6 +1724,13 @@ namespace config {
 
     path_f(vars, "file_apps", stream.file_apps);
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
+    int_between_f(vars, "video_max_batch_size_kb", stream.video_max_batch_size_kb, {0, 64});
+    if (stream.video_max_batch_size_kb == 0) {
+      stream.video_max_batch_size_kb = 64;
+    } else if (stream.video_max_batch_size_kb != 16 && stream.video_max_batch_size_kb != 32 && stream.video_max_batch_size_kb != 64) {
+      BOOST_LOG(warning) << "config: unsupported video_max_batch_size_kb value: " << stream.video_max_batch_size_kb << ", using 64";
+      stream.video_max_batch_size_kb = 64;
+    }
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 
@@ -1779,6 +1792,7 @@ namespace config {
     sunshine.port = (std::uint16_t) port;
 
     string_restricted_f(vars, "address_family", sunshine.address_family, {"ipv4"sv, "both"sv});
+    string_f(vars, "bind_address", sunshine.bind_address);
 
     bool upnp = false;
     bool_f(vars, "upnp"s, upnp);
@@ -1870,6 +1884,20 @@ namespace config {
       );
       if (ttl_secs > 0) {
         sunshine.remember_me_refresh_token_ttl = std::chrono::seconds {ttl_secs};
+      }
+    }
+    {
+      int retention_days = config::sunshine.session_history_ttl_days;
+      int_between_f(vars, "session_history_ttl_days", retention_days, {0, std::numeric_limits<int>::max()});
+      if (retention_days >= 0) {
+        sunshine.session_history_ttl_days = retention_days;
+      }
+    }
+    {
+      int quota_mb = config::sunshine.session_history_db_size_limit_mb;
+      int_between_f(vars, "session_history_db_size_limit_mb", quota_mb, {0, std::numeric_limits<int>::max()});
+      if (quota_mb >= 0) {
+        sunshine.session_history_db_size_limit_mb = quota_mb;
       }
     }
 
@@ -2129,6 +2157,7 @@ namespace config {
 
         // Codec / capture negotiation
         "fec_percentage",
+        "video_max_batch_size_kb",
         "qp",
         "min_threads",
         "hevc_mode",
@@ -2183,6 +2212,10 @@ namespace config {
     std::unordered_map<std::string, std::string> runtime_overrides_snapshot() {
       std::scoped_lock lk(g_runtime_overrides_mutex);
       return g_runtime_config_overrides;
+    }
+
+    bool has_active_stream_sessions() {
+      return rtsp_stream::session_count() > 0 || webrtc_stream::has_active_sessions();
     }
 
 #ifdef _WIN32
@@ -2376,6 +2409,7 @@ namespace config {
       const auto prev_dd_snapshot_exclude_devices = video.dd.snapshot_exclude_devices;
       const auto prev_dd_dummy_plug = video.dd.wa.dummy_plug_hdr10;
       const auto prev_dd_double_refreshrate = video.double_refreshrate;
+      const auto prev_session_history_enabled = sunshine.session_history_enabled;
 
       auto vars = parse_config(file_handler::read_file(sunshine.config_file.c_str()));
       for (const auto &[name, value] : command_line_overrides) {
@@ -2393,6 +2427,12 @@ namespace config {
       const std::string old_log_file = sunshine.log_file;
 
       apply_config(std::move(vars));
+      if (sunshine.session_history_enabled != prev_session_history_enabled && has_active_stream_sessions()) {
+        BOOST_LOG(info) << "Hot-apply: deferring session history enablement change until active sessions end.";
+        sunshine.session_history_enabled = prev_session_history_enabled;
+        g_deferred_reload.store(true, std::memory_order_release);
+      }
+      session_history::reload_settings();
 
       // If only the log level changed, we can reconfigure sinks in place.
       if (sunshine.min_log_level != old_min_level && sunshine.log_file == old_log_file) {
@@ -2482,7 +2522,7 @@ namespace config {
 
   void maybe_apply_deferred() {
     // Single-shot winner clears the flag and applies atomically.
-    if (rtsp_stream::session_count() == 0 && g_deferred_reload.exchange(false, std::memory_order_acq_rel)) {
+    if (!has_active_stream_sessions() && g_deferred_reload.exchange(false, std::memory_order_acq_rel)) {
       apply_config_now();
     }
   }

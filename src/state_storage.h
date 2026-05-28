@@ -1,5 +1,6 @@
 #pragma once
 
+#include <boost/property_tree/ptree_fwd.hpp>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -13,6 +14,25 @@ namespace statefile {
   std::mutex &state_mutex();
 
   bool share_state_file();
+
+  /**
+   * @brief Write a property-tree JSON file through a temporary file and atomic replace.
+   *
+   * Callers that update shared state should still hold state_mutex() around
+   * their read/modify/write transaction; this helper only prevents partial
+   * on-disk writes from leaving malformed JSON behind.
+   */
+  void write_json_atomic(const std::string &path, const boost::property_tree::ptree &tree);
+
+  /**
+   * @brief Best-effort repair for Windows config ACL inheritance.
+   *
+   * A previous session history build could protect the shared config directory
+   * while tightening the history database. This restores inheritance on the
+   * shared config directory and known mutable config/state files without
+   * touching intentionally private subdirectories such as credentials.
+   */
+  void repair_config_permissions();
 
   void migrate_recent_state_keys();
 

@@ -12,6 +12,7 @@
   #include <chrono>
   #include <cmath>
   #include <cstdint>
+  #include <exception>
   #include <filesystem>
   #include <limits>
   #include <mutex>
@@ -202,9 +203,13 @@ namespace {
   constexpr std::chrono::milliseconds kHelperIpcReadyTimeout {5000};
   constexpr std::chrono::milliseconds kHelperIpcReadyPoll {100};
 
-  // Stream-start requirement: stop any helper restore activity immediately.
+  // Stream-start requirement: stop very recent helper restore activity quickly.
+  // Once the helper has had time to begin an actual restore, do not kill/overwrite
+  // that in-flight restore from a later stream-start probe; the helper will either
+  // finish restoring or an explicit APPLY will supersede it.
   constexpr std::chrono::milliseconds kDisarmRestoreBudget {150};
   constexpr std::chrono::milliseconds kDisarmRetryThrottle {150};
+  constexpr std::chrono::milliseconds kDisarmRestoreGrace {5000};
   constexpr std::chrono::milliseconds kDeferredApplyInitialDelay {2000};
   constexpr std::chrono::milliseconds kDeferredApplyRetryBase {500};
   constexpr std::chrono::milliseconds kDeferredApplyRetryMax {10000};
@@ -213,6 +218,16 @@ namespace {
   bool shutdown_requested();
   bool ensure_helper_started(bool force_restart = false, bool force_enable = false);
   const char *virtual_layout_to_string(const display_helper_integration::VirtualDisplayArrangement layout);
+
+  bool helper_process_running() {
+    std::lock_guard<std::mutex> lg(helper_mutex());
+    if (HANDLE h = helper_proc().get_process_handle()) {
+      return WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    }
+    return false;
+  }
+
+  bool restore_expected_with_live_helper();
 
   std::chrono::milliseconds deferred_apply_retry_delay(int attempts) {
     if (attempts <= 0) {
@@ -585,6 +600,17 @@ namespace {
     return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
   }
 
+  bool restore_expected_with_live_helper() {
+    if (!g_restore_expected.load(std::memory_order_relaxed)) {
+      return false;
+    }
+    if (helper_process_running()) {
+      return true;
+    }
+    g_restore_expected.store(false, std::memory_order_relaxed);
+    return false;
+  }
+
   // Active session display parameters snapshot for re-apply on reconnect.
   // We do NOT cache serialized JSON, only the subset of session fields that
   // affect display configuration. On reconnect, we rebuild the full
@@ -624,20 +650,25 @@ namespace {
       return false;
     }
 
-    bool helper_running = false;
-    {
-      std::lock_guard<std::mutex> lg(helper_mutex());
-      if (HANDLE h = helper_proc().get_process_handle()) {
-        helper_running = (WaitForSingleObject(h, 0) == WAIT_TIMEOUT);
-      }
-    }
-
+    const bool helper_running = helper_process_running();
     if (!helper_running) {
+      g_restore_expected.store(false, std::memory_order_relaxed);
       return false;
     }
 
     const bool restore_expected = g_restore_expected.load(std::memory_order_relaxed);
     const auto now_us = now_steady_us();
+    const auto last_revert_us = g_last_revert_us.load(std::memory_order_relaxed);
+    if (restore_expected && last_revert_us > 0) {
+      const auto disarm_grace_us = kDisarmRestoreGrace.count() * 1000LL;
+      if ((now_us - last_revert_us) >= disarm_grace_us) {
+        BOOST_LOG(info) << "Display helper: restore has been pending for more than "
+                        << kDisarmRestoreGrace.count()
+                        << "ms; not sending DISARM so the unconfirmed restore can complete.";
+        return false;
+      }
+    }
+
     const auto last_attempt_us = g_last_disarm_attempt_us.load(std::memory_order_relaxed);
 
     // Don't spam DISARM frames (they share the helper's job/message queues with APPLY/REVERT).
@@ -694,7 +725,6 @@ namespace {
 
     // Fail-safe: if we recently initiated a helper restore, and DISARM couldn't be delivered quickly,
     // terminate the helper so restore activity stops immediately (prevents virtual display crash loops).
-    const auto last_revert_us = g_last_revert_us.load(std::memory_order_relaxed);
     const bool revert_recent = (now_us - last_revert_us) < (30LL * 1000LL * 1000LL);
     if (revert_recent) {
       BOOST_LOG(warning) << "Display helper: DISARM could not be delivered within "
@@ -1000,12 +1030,9 @@ namespace {
   }
 
   std::string build_revert_payload(bool prefer_golden_if_current_missing) {
-    if (!prefer_golden_if_current_missing) {
-      return {};
-    }
-
     nlohmann::json j = nlohmann::json::object();
-    j["sunshine_prefer_golden_if_current_missing"] = true;
+    j["sunshine_prefer_golden_if_current_missing"] = prefer_golden_if_current_missing;
+    j["sunshine_always_restore_from_golden"] = config::video.dd.always_restore_from_golden;
     return j.dump();
   }
 
@@ -1015,47 +1042,65 @@ namespace {
     constexpr auto kSuspendedInterval = 20s;
     bool helper_ready = false;
 
-    while (!st.stop_requested()) {
-      if (!dd_feature_enabled()) {
-        if (helper_ready) {
-          platf::display_helper_client::reset_connection();
-          helper_ready = false;
-        }
-        for (auto slept = 0ms; slept < kActiveInterval && !st.stop_requested(); slept += 100ms) {
-          std::this_thread::sleep_for(100ms);
-        }
-        continue;
-      }
-
-      if (!helper_ready) {
-        helper_ready = ensure_helper_started();
-        if (!helper_ready) {
-          for (auto slept = 0ms; slept < kActiveInterval && !st.stop_requested(); slept += 100ms) {
-            std::this_thread::sleep_for(100ms);
-          }
-          continue;
-        }
-        (void) platf::display_helper_client::send_ping();
-      }
-
-      const bool suspended = (rtsp_stream::session_count() == 0) && (proc::proc.running() > 0);
-      const auto interval = suspended ? kSuspendedInterval : kActiveInterval;
+    auto sleep_interruptible = [&st](std::chrono::milliseconds interval) {
       for (auto slept = 0ms; slept < interval && !st.stop_requested(); slept += 100ms) {
         std::this_thread::sleep_for(100ms);
       }
-      if (st.stop_requested()) {
-        break;
-      }
-
-      if (!platf::display_helper_client::send_ping()) {
-        // Avoid logging ping failures to reduce log spam; proceed to reconnect
+    };
+    auto reset_connection_noexcept = []() noexcept {
+      try {
         platf::display_helper_client::reset_connection();
-        helper_ready = ensure_helper_started();
-        if (!helper_ready) {
+      } catch (...) {
+      }
+    };
+
+    while (!st.stop_requested()) {
+      try {
+        if (!dd_feature_enabled()) {
+          if (helper_ready) {
+            platf::display_helper_client::reset_connection();
+            helper_ready = false;
+          }
+          sleep_interruptible(kActiveInterval);
           continue;
         }
-        // Do not re-apply automatically on reconnect; just confirm IPC is reachable.
-        helper_ready = platf::display_helper_client::send_ping();
+
+        if (!helper_ready) {
+          helper_ready = ensure_helper_started();
+          if (!helper_ready) {
+            sleep_interruptible(kActiveInterval);
+            continue;
+          }
+          (void) platf::display_helper_client::send_ping();
+        }
+
+        const bool suspended = (rtsp_stream::session_count() == 0) && (proc::proc.running() > 0);
+        const auto interval = suspended ? kSuspendedInterval : kActiveInterval;
+        sleep_interruptible(interval);
+        if (st.stop_requested()) {
+          break;
+        }
+
+        if (!platf::display_helper_client::send_ping()) {
+          // Avoid logging ping failures to reduce log spam; proceed to reconnect
+          platf::display_helper_client::reset_connection();
+          helper_ready = ensure_helper_started();
+          if (!helper_ready) {
+            continue;
+          }
+          // Do not re-apply automatically on reconnect; just confirm IPC is reachable.
+          helper_ready = platf::display_helper_client::send_ping();
+        }
+      } catch (const std::exception &e) {
+        BOOST_LOG(error) << "Display helper watchdog failed: " << e.what();
+        reset_connection_noexcept();
+        helper_ready = false;
+        sleep_interruptible(kActiveInterval);
+      } catch (...) {
+        BOOST_LOG(error) << "Display helper watchdog failed with an unknown exception.";
+        reset_connection_noexcept();
+        helper_ready = false;
+        sleep_interruptible(kActiveInterval);
       }
     }
   }
@@ -1097,9 +1142,17 @@ namespace display_helper_integration {
 
       // Stream-start policy: if a helper is already running, hard-restart it immediately
       // rather than attempting graceful STOP (avoids apply timeouts and wedged restore loops).
+      // Exception: if we recently asked the helper to restore and did not cancel it inside
+      // the short disarm grace window, keep that helper alive and let APPLY supersede the
+      // restore through IPC. Killing it here can strand the host in a partially restored
+      // physical-display mode when a monitor input is still switched away.
       // In SYSTEM/no-user-session mode we still keep hard restart to recover stale pipe state,
       // but we avoid in-process display API fallback if helper IPC remains unavailable.
-      const bool hard_restart = (request.session != nullptr);
+      const bool restore_expected = restore_expected_with_live_helper();
+      const bool hard_restart = (request.session != nullptr) && !restore_expected;
+      if (request.session && restore_expected) {
+        BOOST_LOG(info) << "Display helper: reusing existing helper because an unconfirmed restore is pending; APPLY will supersede it.";
+      }
 
       bool helper_ready = ensure_helper_started(hard_restart, true);
       if (!helper_ready && hard_restart) {
@@ -1121,6 +1174,7 @@ namespace display_helper_integration {
         const bool ok = platf::display_helper_client::send_apply_json(*payload);
         BOOST_LOG(info) << "Display helper: APPLY dispatch result=" << (ok ? "true" : "false");
         if (ok && request.session) {
+          g_restore_expected.store(false, std::memory_order_relaxed);
           g_last_apply_completed_us.store(now_steady_us(), std::memory_order_relaxed);
           set_active_session(
             *request.session,
@@ -1238,6 +1292,11 @@ namespace display_helper_integration {
   }
 
   bool snapshot_current_display_state() {
+    if (restore_expected_with_live_helper()) {
+      BOOST_LOG(info) << "Display helper: skipping SNAPSHOT_CURRENT while an unconfirmed restore is pending.";
+      return false;
+    }
+
     if (!ensure_helper_started()) {
       BOOST_LOG(info) << "Display helper unavailable; cannot snapshot current display state.";
       return false;

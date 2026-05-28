@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <codecvt>
 #include <csignal>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 
@@ -13,6 +14,7 @@
 #include "confighttp.h"
 #include "entry_handler.h"
 #include "globals.h"
+#include "host_stats.h"
 #include "httpcommon.h"
 #include "logging.h"
 #include "main.h"
@@ -22,13 +24,18 @@
 #include "system_tray.h"
 #include "update.h"
 #include "upnp.h"
+#include "version_compare.h"
 #include "uuid.h"
 #include "video.h"
+#include "session_history.h"
+#include "state_storage.h"
 #include "webrtc_stream.h"
 #ifdef _WIN32
   #include <shobjidl.h>
 
+  #include "src/display_helper_integration.h"
   #include "src/platform/windows/frame_limiter_nvcp.h"
+  #include "src/platform/windows/misc.h"
   #include "src/platform/windows/playnite_integration.h"
   #include "src/platform/windows/rtss_integration.h"
   #include "src/platform/windows/virtual_display.h"
@@ -184,11 +191,9 @@ int main(int argc, char *argv[]) {
   // if anything is logged prior to this point, it will appear in stdout, but not in the log viewer in the UI
   // the version should be printed to the log before anything else
   BOOST_LOG(info) << PROJECT_NAME << " version: " << PROJECT_VERSION << " commit: " << PROJECT_VERSION_COMMIT;
-#ifdef PROJECT_VERSION_PRERELEASE
-  if (std::string_view(PROJECT_VERSION_PRERELEASE).size() > 0) {
+  if (version_compare::is_prerelease_channel(PROJECT_VERSION)) {
     BOOST_LOG(info) << "Prerelease build detected; default min_log_level is debug unless overridden.";
   }
-#endif
   BOOST_LOG(info) << "Effective min_log_level=" << config::sunshine.min_log_level;
 
   // Log publisher metadata
@@ -199,6 +204,10 @@ int main(int argc, char *argv[]) {
     BOOST_LOG(info) << "config: '"sv << name << "' = "sv << val;
   }
   config::modified_config_settings.clear();
+
+#ifdef _WIN32
+  statefile::repair_config_permissions();
+#endif
 
 #ifdef _WIN32
   platf::frame_limiter_nvcp::restore_pending_overrides();
@@ -427,6 +436,8 @@ int main(int argc, char *argv[]) {
     BOOST_LOG(error) << "Platform failed to initialize"sv;
   }
 
+  auto host_stats_deinit_guard = host_stats::start();
+
   if (shutdown_event->peek()) {
     return lifetime::desired_exit_code;
   }
@@ -491,6 +502,11 @@ int main(int argc, char *argv[]) {
     }
 
 #ifdef _WIN32
+    if (!platf::is_default_input_desktop_active()) {
+      BOOST_LOG(info) << "Startup encoder probe deferred until the interactive desktop is ready.";
+      return;
+    }
+
     // Ensure a display is available first; probing encoders generally requires a display.
     auto encoder_probe_display_result = VDISPLAY::ensure_display();
     if (!encoder_probe_display_result.success) {
@@ -540,6 +556,58 @@ int main(int argc, char *argv[]) {
   };
 
   startup_probe();
+
+  // Initialize session history in its own directory so database hardening never
+  // touches the shared config root that also contains credentials/pairing state.
+  {
+    std::filesystem::path state_path {config::nvhttp.file_state};
+    const auto config_dir = state_path.parent_path();
+    const auto history_dir = config_dir / "session_history";
+    const auto history_db = history_dir / "session_history.db";
+
+    // Best-effort alpha.1/alpha.2 migration: preserve any database that was
+    // created in the shared config root before the storage was isolated.
+    const auto legacy_history_db = config_dir / "session_history.db";
+    auto move_if_needed = [](const std::filesystem::path &from, const std::filesystem::path &to) -> bool {
+      std::error_code ec;
+      const bool from_exists = std::filesystem::exists(from, ec);
+      if (!from_exists || ec) {
+        return false;
+      }
+      ec.clear();
+      const bool to_exists = std::filesystem::exists(to, ec);
+      if (to_exists || ec) {
+        return false;
+      }
+
+      ec.clear();
+      std::filesystem::create_directories(to.parent_path(), ec);
+      if (ec) {
+        BOOST_LOG(warning) << "session_history: failed to create isolated history directory "
+                           << to.parent_path().string() << ": " << ec.message();
+        return false;
+      }
+
+      std::filesystem::rename(from, to, ec);
+      if (ec) {
+        BOOST_LOG(warning) << "session_history: failed to move legacy database file "
+                           << from.string() << " to " << to.string() << ": " << ec.message();
+        return false;
+      }
+
+      return true;
+    };
+    const bool migrated_main_db = move_if_needed(legacy_history_db, history_db);
+    if (migrated_main_db) {
+      move_if_needed(legacy_history_db.string() + "-wal", history_db.string() + "-wal");
+      move_if_needed(legacy_history_db.string() + "-shm", history_db.string() + "-shm");
+    }
+
+    session_history::init(history_db.string());
+  }
+  auto session_history_shutdown_guard = util::fail_guard([]() {
+    session_history::shutdown();
+  });
 
   if (http::init()) {
     BOOST_LOG(fatal) << "HTTP interface failed to initialize"sv;
@@ -593,6 +661,17 @@ int main(int argc, char *argv[]) {
   configThread.join();
   rtspThread.join();
 
+#ifdef _WIN32
+  // Full process shutdown cannot leave the paused-session watchdog running.
+  // If it survives past main(), CRT teardown can fast-fail while the helper
+  // watchdog thread is still unwinding.
+  display_helper_integration::stop_watchdog();
+
+  // The legacy SudoVDA watchdog thread also lives in static storage.
+  // Ensure it is joined before CRT on-exit handlers destroy the thread object.
+  VDISPLAY::closeVDisplayDevice();
+#endif
+
   task_pool.stop();
   task_pool.join();
 
@@ -609,6 +688,8 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
+  session_history::shutdown();
+  session_history_shutdown_guard.disable();
+
   return lifetime::desired_exit_code;
 }
-

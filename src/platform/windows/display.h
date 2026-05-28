@@ -46,6 +46,7 @@ namespace platf::dxgi {
   std::optional<LUID> get_last_wgc_adapter_luid();
   void set_dxgi_adapter_luid_override(std::optional<LUID> luid);
   std::optional<LUID> get_dxgi_adapter_luid_override();
+  std::string current_display_adapter_name();
   using dxgi1_t = util::safe_ptr<IDXGIDevice1, Release<IDXGIDevice1>>;
   using device_t = util::safe_ptr<ID3D11Device, Release<ID3D11Device>>;
   using device1_t = util::safe_ptr<ID3D11Device1, Release<ID3D11Device1>>;
@@ -178,15 +179,15 @@ namespace platf::dxgi {
     output_t output;
     device_t device;
     device_ctx_t device_ctx;
-    DXGI_RATIONAL display_refresh_rate;
-    int display_refresh_rate_rounded;
+    DXGI_RATIONAL display_refresh_rate {0, 1};
+    int display_refresh_rate_rounded {};
 
     DXGI_MODE_ROTATION display_rotation = DXGI_MODE_ROTATION_UNSPECIFIED;
     int width_before_rotation;
     int height_before_rotation;
 
-    int client_frame_rate;
-    DXGI_RATIONAL client_frame_rate_strict;
+    int client_frame_rate {};
+    DXGI_RATIONAL client_frame_rate_strict {0, 0};
 
     DXGI_FORMAT capture_format;
     D3D_FEATURE_LEVEL feature_level;
@@ -392,9 +393,6 @@ namespace platf::dxgi {
    * allowing screen capture even when running as a SYSTEM service.
    */
   class display_wgc_ipc_vram_t: public display_vram_t {
-    // Cache for frame forwarding when no new frame is available
-    std::shared_ptr<platf::img_t> last_cached_frame;
-
   public:
     /**
      * @brief Constructs a new display_wgc_ipc_vram_t object.
@@ -552,10 +550,6 @@ namespace platf::dxgi {
      */
     DXGI_FORMAT _last_format = DXGI_FORMAT_UNKNOWN;
 
-    /**
-     * @brief Cache for frame forwarding when no new frame is available, only used in constant capture mode.
-     */
-    std::shared_ptr<platf::img_t> last_cached_frame;
   };
 
   /**
